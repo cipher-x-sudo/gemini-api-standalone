@@ -6,73 +6,64 @@ This is **not** the official Google Generative AI SDK; it uses browser session c
 
 ## Features
 
-- **Docker + volume**: Cookie cache and per-profile data live under `/data` (mapped volume in Compose).
-- **`GEMINI_COOKIE_PATH`**: Each profile directory is set as `GEMINI_COOKIE_PATH` before `GeminiClient` init so the library’s built-in rotation / `save_cookies` targets that path (see upstream `gemini_webapi` docs).
-- **Multi-profile**: Header `X-Gemini-Profile: myaccount` isolates cookies under `/data/profiles/<profile>/`.
-- **Nexus-shaped API**: `POST /v1/list-models`, `/v1/generate`, `/v1/status` with the same JSON bodies as the Nexus gemini-web-bridge (cookies optional if already saved for that profile).
-- **Admin UI**: `GET /admin` — paste cookies JSON; stored at `profiles/<id>/cookies.json`.
-- **Optional API key**: Set `GEMINI_API_CLIENT_KEY` to require header `X-Gemini-Api-Key` on `/v1/*` (in addition to Cloudflare).
+- **Single `docker-compose.yml`**: `gemini-api` + **`cloudflared`** on one shared external Docker network with your other stacks (`frontend`, etc.).
+- **Docker + volume**: Cookie data under `/data` (named volume `gemini_data`).
+- **Multi-profile**: header `X-Gemini-Profile` isolates cookies per Google account.
+- **Control UI** at `/ui` for cookies, models from Gemini Web, and test calls.
+
+## Prerequisites
+
+1. A **Docker network** that your other services already use (e.g. `portico_default`). It must **exist** before `docker compose up` (`docker network ls`). If your main compose creates it, start that stack once first, or run `docker network create portico_default`.
+2. **Stop** any other `cloudflared` container using the **same** `TUNNEL_TOKEN` (only one connector per tunnel).
 
 ## Quick start
 
 ```bash
 cd gemini-api-standalone
 cp .env.example .env
-# Edit .env — set ADMIN_API_KEY to a long random string
+# Edit .env: ADMIN_API_KEY, TUNNEL_TOKEN, DOCKER_NETWORK
 docker compose --env-file .env up -d --build
 ```
 
-Open **`http://localhost:4000/`** (or whatever **`GEMINI_API_PORT`** you set) and **`/ui`** — the **control panel** lets you set admin/client keys in the browser session, manage profiles and cookies, and try **status**, **list models**, and **generate** without curl. Legacy URL **`/admin`** redirects to `/ui`.
+Open **`http://localhost:4000/ui`** (or your host port) for the control panel, or **`https://gemini.prismacreative.online/ui`** via Cloudflare once routes are saved.
 
-**Ports:** The app listens inside the container on **`GEMINI_INTERNAL_PORT`** (default **9380**, not 8080). Compose maps **`GEMINI_API_PORT`** (default **4000**) on the host to that internal port. Point Cloudflare Tunnel at `http://127.0.0.1:<GEMINI_API_PORT>`.
+**Ports**
 
-Paste cookies from `gemini.google.com` (see upstream README for `__Secure-1PSID` / `__Secure-1PSIDTS`) under **Profiles & cookies**.
+| Where | What |
+| ----- | ---- |
+| Inside Docker | **`gemini-api:9380`** — use this in Cloudflare **Published application route → Service** |
+| Host | **`localhost:4000`** (default `GEMINI_API_PORT`) — debugging only |
 
-Then call the API with header `X-Gemini-Profile: default` and either:
+**Cloudflare Zero Trust** (same tunnel as `frontend`): add a route e.g. `gemini.prismacreative.online` → **`http://gemini-api:9380`**.
 
-- **No `cookies` in body** — uses saved file for that profile, or  
-- **`cookies` in body** — merged over saved file (same as Nexus).
+## Cloudflare checklist
 
-Example:
-
-```bash
-curl -sS -X POST "http://127.0.0.1:4000/v1/generate" \
-  -H "Content-Type: application/json" \
-  -H "X-Gemini-Profile: default" \
-  -d '{"prompt":"Say hello in one sentence.","cookies":{}}'
-```
-
-(Empty `cookies` works only after cookies were saved for that profile via `/admin`.)
-
-## Cloudflare (recommended on a VPS)
-
-1. **DNS**: Point your subdomain to the origin (or use **Cloudflare Tunnel** and no public inbound ports).
-2. **Access (Zero Trust)**: Add an **Application** for `https://gemini-api.example.com` and restrict to your email/IdP so the Internet cannot hit `/admin` or `/v1/*` without identity.
-3. **SSL/TLS**: **Full (strict)** to origin if origin presents a valid cert; with Tunnel, TLS is often terminated at the edge.
-4. **Origin**: Keep `ADMIN_API_KEY` strong; optionally set `GEMINI_API_CLIENT_KEY` and send `X-Gemini-Api-Key` from trusted clients.
-
-Cloudflare mitigates DDoS and unauthenticated access; it does **not** replace locking down SSH, firewall rules, and volume backups for `/data`.
+1. **Tunnel token**: Zero Trust → **Networks** → **Tunnels** → your tunnel → **Configure** → copy token into `.env` as `TUNNEL_TOKEN`.
+2. **Published routes** (example): `proxy…` → `http://frontend:80`, `gemini…` → `http://gemini-api:9380`.
+3. **Access** (optional): protect the hostname with Cloudflare Access.
+4. **SSL/TLS** (zone): **Full** is typical with tunnel → origin HTTP.
 
 ## Environment
 
 | Variable | Description |
 | -------- | ----------- |
-| `GEMINI_PROFILES_ROOT` | Root for profiles (default `/data/profiles`). |
-| `GEMINI_INTERNAL_PORT` | Port **inside** the container for uvicorn (default **9380**). |
-| `GEMINI_API_PORT` | Host port in Compose mapping (default **4000** → internal port). |
-| `ADMIN_API_KEY` | Bearer token for `POST /admin/api/profiles/.../cookies` and `GET /admin/api/profiles`. |
-| `GEMINI_API_CLIENT_KEY` | If set, required as `X-Gemini-Api-Key` on `/v1/*`. |
+| `ADMIN_API_KEY` | Bearer token for admin API + UI auth. |
+| `TUNNEL_TOKEN` | Cloudflare tunnel connector token (required). |
+| `DOCKER_NETWORK` | **Existing** external network name (e.g. `portico_default`). |
+| `GEMINI_INTERNAL_PORT` | Inside `gemini-api` (default **9380**). Must match tunnel URL. |
+| `GEMINI_API_PORT` | Published host port (default **4000**). |
+| `GEMINI_API_CLIENT_KEY` | Optional; if set, required as `X-Gemini-Api-Key` on `/v1/*`. |
 
 ## Layout on disk
 
 ```
-/data/
+/data/   (Docker volume gemini_data)
   profiles/
-    default/
-      cookies.json          # user/admin written + updated after requests
-      .cached_cookies_*.json # gemini_webapi library cache (when using GEMINI_COOKIE_PATH)
+    <profile>/
+      cookies.json
+      .cached_cookies_*.json   # gemini_webapi cache when GEMINI_COOKIE_PATH is set
 ```
 
 ## License
 
-The Nexus repository license applies to this folder. Upstream `gemini_webapi` is AGPL-3.0 — comply when redistributing.
+Upstream `gemini_webapi` is AGPL-3.0 — comply when redistributing.
