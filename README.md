@@ -22,7 +22,9 @@ cp .env.example .env
 docker compose --env-file .env up -d --build
 ```
 
-Open **`http://localhost:8080/`** or **`/ui`** — the **control panel** lets you set admin/client keys in the browser session, manage profiles and cookies, and try **status**, **list models**, and **generate** without curl. Legacy URL **`/admin`** redirects to `/ui`.
+Open **`http://localhost:4000/`** (or whatever **`GEMINI_API_PORT`** you set) and **`/ui`** — the **control panel** lets you set admin/client keys in the browser session, manage profiles and cookies, and try **status**, **list models**, and **generate** without curl. Legacy URL **`/admin`** redirects to `/ui`.
+
+**Ports:** The app listens inside the container on **`GEMINI_INTERNAL_PORT`** (default **9380**, not 8080). Compose maps **`GEMINI_API_PORT`** (default **4000**) on the host to that internal port. Point Cloudflare Tunnel at `http://127.0.0.1:<GEMINI_API_PORT>`.
 
 Paste cookies from `gemini.google.com` (see upstream README for `__Secure-1PSID` / `__Secure-1PSIDTS`) under **Profiles & cookies**.
 
@@ -34,7 +36,7 @@ Then call the API with header `X-Gemini-Profile: default` and either:
 Example:
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:8080/v1/generate" \
+curl -sS -X POST "http://127.0.0.1:4000/v1/generate" \
   -H "Content-Type: application/json" \
   -H "X-Gemini-Profile: default" \
   -d '{"prompt":"Say hello in one sentence.","cookies":{}}'
@@ -56,6 +58,8 @@ Cloudflare mitigates DDoS and unauthenticated access; it does **not** replace lo
 | Variable | Description |
 | -------- | ----------- |
 | `GEMINI_PROFILES_ROOT` | Root for profiles (default `/data/profiles`). |
+| `GEMINI_INTERNAL_PORT` | Port **inside** the container for uvicorn (default **9380**). |
+| `GEMINI_API_PORT` | Host port in Compose mapping (default **4000** → internal port). |
 | `ADMIN_API_KEY` | Bearer token for `POST /admin/api/profiles/.../cookies` and `GET /admin/api/profiles`. |
 | `GEMINI_API_CLIENT_KEY` | If set, required as `X-Gemini-Api-Key` on `/v1/*`. |
 

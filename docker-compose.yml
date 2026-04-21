@@ -4,9 +4,11 @@ services:
     build: .
     image: gemini-api-standalone:local
     ports:
-      - "${GEMINI_API_PORT:-8080}:8080"
+      # host:container — host port (e.g. 4000) maps to GEMINI_INTERNAL_PORT inside the image (default 9380)
+      - "${GEMINI_API_PORT:-4000}:${GEMINI_INTERNAL_PORT:-9380}"
     environment:
       GEMINI_PROFILES_ROOT: /data/profiles
+      GEMINI_INTERNAL_PORT: ${GEMINI_INTERNAL_PORT:-9380}
       # Required: long random string. Protect this host with Cloudflare Access or a private network.
       ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
       # Optional: require this header on /v1/* in addition to Cloudflare (defense in depth)
@@ -15,7 +17,7 @@ services:
       - gemini_data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:$$GEMINI_INTERNAL_PORT/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
