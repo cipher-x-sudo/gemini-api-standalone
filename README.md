@@ -72,6 +72,7 @@ Start **this** `gemini-api-standalone` stack **once** so the network exists, the
 | `GEMINI_PROFILES_ROOT` | Directory for per-profile data (default **`/data/profiles`** in Docker). |
 | `GEMINI_AUTO_ROTATE` | If `true`/`1`/`yes`/`on`, runs background **auto-rotation** of `__Secure-1PSIDTS` (same as upstream `auto_refresh`). Alias: `GEMINI_AUTO_REFRESH`. Default **true**. |
 | `GEMINI_REFRESH_INTERVAL_SECONDS` | Seconds between rotation attempts when auto-rotate is on (minimum **60**; library clamps lower values). Default **600**. |
+| `GEMINI_V1_DEFAULT_PROFILE` | Used when **`X-Gemini-Profile` is omitted**. Default **`default`**. Set to **`random`** (or `any` / `*`) to pick a **random** profile that already has saved `cookies.json` (same effect as sending header `X-Gemini-Profile: random`). |
 
 Restart the service after changing rotation settings so existing Gemini clients are recreated.
 
@@ -94,13 +95,17 @@ Unless noted, JSON bodies use `Content-Type: application/json`.
 
 ### Nexus-compatible (`/v1`)
 
-All routes accept optional header **`X-Gemini-Profile`** (default `default`) to select a cookie profile. If **`GEMINI_API_CLIENT_KEY`** is set, every request must include **`X-Gemini-Api-Key`** with that value.
+**Cookies in the JSON body are optional.** If you omit `cookies` (or send `null`), the server uses **`profiles/<profile>/cookies.json`** for the chosen profile. Body cookies, when present, **override** on-disk values for that request only.
+
+**Profile selection:** header **`X-Gemini-Profile`** (optional). If you omit it, the server uses **`GEMINI_V1_DEFAULT_PROFILE`** (default profile name **`default`**). To use a **random** account among those that already have saved cookies, send **`X-Gemini-Profile: random`** (also accepted: `any`, `*`) or set **`GEMINI_V1_DEFAULT_PROFILE=random`**. Responses include **`profile`** so you can see which profile was used (including after a random pick).
+
+If **`GEMINI_API_CLIENT_KEY`** is set, every request must include **`X-Gemini-Api-Key`** with that value.
 
 | Method | Path | Body | Description |
 | ------ | ---- | ---- | ----------- |
-| `POST` | `/v1/list-models` | `{ "cookies": { ... } }` | Lists models; `cookies` optional if profile already has `cookies.json` on disk. |
-| `POST` | `/v1/generate` | `{ "prompt", "model"?, "responseMimeType"?, "images"?, "cookies"? }` | Text generation; optional `images`: `[{ "mimeType", "base64" }]`. |
-| `POST` | `/v1/status` | `{ "cookies": { ... } }` | Account/session status for the current cookies. |
+| `POST` | `/v1/list-models` | `{ "cookies": ... }` optional | Lists models. Response: `models`, **`profile`**. |
+| `POST` | `/v1/generate` | `{ "prompt", "model"?, "responseMimeType"?, "images"?, "cookies"? }` | Text generation; optional `images`: `[{ "mimeType", "base64" }]`. Response: `text`, **`profile`**. |
+| `POST` | `/v1/status` | `{ "cookies": ... }` optional | Account/session status. Includes **`profile`**. |
 
 ### Admin (Bearer token)
 

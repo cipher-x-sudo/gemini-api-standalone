@@ -22,6 +22,7 @@ services:
       GEMINI_API_CLIENT_KEY: ${GEMINI_API_CLIENT_KEY:-}
       GEMINI_AUTO_ROTATE: ${GEMINI_AUTO_ROTATE:-true}
       GEMINI_REFRESH_INTERVAL_SECONDS: ${GEMINI_REFRESH_INTERVAL_SECONDS:-600}
+      GEMINI_V1_DEFAULT_PROFILE: ${GEMINI_V1_DEFAULT_PROFILE:-default}
     volumes:
       - gemini_data:/data
     restart: unless-stopped
