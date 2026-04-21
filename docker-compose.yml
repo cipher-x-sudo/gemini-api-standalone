@@ -1,13 +1,12 @@
 # Gemini Web API + Cloudflare Tunnel (single file).
-# gemini-api and cloudflared share one external Docker network with your other services (e.g. frontend).
+# Creates Docker network `gemini-prismacreative-net` automatically — no DOCKER_NETWORK env.
 #
-# Prerequisites:
-#   - Network must exist before `docker compose up` (e.g. created by your main stack, or: docker network create portico_default)
-#   - Stop any OTHER cloudflared using the same TUNNEL_TOKEN (only one connector per tunnel).
+# Stop any OTHER cloudflared using the same TUNNEL_TOKEN before starting this stack.
 #
 # Up: docker compose --env-file .env up -d --build
 #
-# Cloudflare route for Gemini: http://gemini-api:9380 (internal port, not GEMINI_API_PORT)
+# Cloudflare route for Gemini: http://gemini-api:9380
+# For proxy.prismacreative.online → frontend:80, attach `frontend` to the same network (see README).
 
 services:
   gemini-api:
@@ -34,7 +33,7 @@ services:
 
   cloudflared:
     image: cloudflare/cloudflared:latest
-    container_name: cloudflared
+    container_name: cloudflared-gemini
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
@@ -46,8 +45,8 @@ services:
 
 networks:
   edge:
-    external: true
-    name: ${DOCKER_NETWORK:?set DOCKER_NETWORK in .env e.g. portico_default}
+    name: gemini-prismacreative-net
+    driver: bridge
 
 volumes:
   gemini_data:
