@@ -20,6 +20,8 @@ services:
       GEMINI_INTERNAL_PORT: ${GEMINI_INTERNAL_PORT:-9380}
       ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
       GEMINI_API_CLIENT_KEY: ${GEMINI_API_CLIENT_KEY:-}
+      GEMINI_AUTO_ROTATE: ${GEMINI_AUTO_ROTATE:-true}
+      GEMINI_REFRESH_INTERVAL_SECONDS: ${GEMINI_REFRESH_INTERVAL_SECONDS:-600}
     volumes:
       - gemini_data:/data
     restart: unless-stopped

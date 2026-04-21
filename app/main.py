@@ -2,8 +2,9 @@
 Standalone Gemini Web API (gemini_webapi) for VPS/Docker.
 
 - Per-profile cookie dirs under GEMINI_PROFILES_ROOT; each sets GEMINI_COOKIE_PATH so the library
-  persists rotated cookies (see gemini_webapi rotate_1psidts / save_cookies).
-- Nexus-compatible routes: POST /v1/list-models, /v1/generate, /v1/status (cookies in body or on-disk).
+  persists rotated cookies (gemini_webapi background task: rotate_1psidts / save_cookies).
+- Optional env: GEMINI_AUTO_ROTATE (or GEMINI_AUTO_REFRESH), GEMINI_REFRESH_INTERVAL_SECONDS.
+- Nexus-compatible routes: POST /v1/list-models, /v1/generate, /v1/status (cookies optional if on-disk; X-Gemini-Profile: random or GEMINI_V1_DEFAULT_PROFILE=random).
 - Admin: paste cookies per profile (Bearer ADMIN_API_KEY).
 
 Set ADMIN_API_KEY and put the service behind Cloudflare Access or a private network.
@@ -19,6 +20,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import sys
 import shutil
 import tempfile
@@ -46,7 +48,33 @@ PROFILES_ROOT = Path(os.environ.get("GEMINI_PROFILES_ROOT", "/data/profiles")).r
 ADMIN_API_KEY = (os.environ.get("ADMIN_API_KEY") or "").strip()
 OPTIONAL_CLIENT_KEY = (os.environ.get("GEMINI_API_CLIENT_KEY") or "").strip()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
+
+
+# Background rotation of __Secure-1PSIDTS (gemini_webapi start_auto_refresh → rotate_1psidts).
+GEMINI_AUTO_ROTATE = _env_bool(
+    "GEMINI_AUTO_ROTATE",
+    _env_bool("GEMINI_AUTO_REFRESH", True),
+)
+GEMINI_REFRESH_INTERVAL_SECONDS = max(60.0, _env_float("GEMINI_REFRESH_INTERVAL_SECONDS", 600.0))
+
 _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
+_PROFILE_RANDOM_ALIASES = frozenset(s.lower() for s in ("random", "any", "*"))
 
 _CONTROL_PANEL_HTML = Path(__file__).resolve().parent / "control_panel.html"
 
@@ -71,8 +99,13 @@ def _sanitize_profile_id(raw: str) -> str:
     return t
 
 
+def profile_root_dir(profile_id: str) -> Path:
+    """Resolved profile directory path; does not create the directory."""
+    return PROFILES_ROOT / _sanitize_profile_id(profile_id)
+
+
 def profile_data_dir(profile_id: str) -> Path:
-    d = PROFILES_ROOT / _sanitize_profile_id(profile_id)
+    d = profile_root_dir(profile_id)
     d.mkdir(parents=True, mode=0o700, exist_ok=True)
     return d
 
@@ -146,6 +179,46 @@ def load_cookies_json_file(path: Path) -> Optional[dict[str, str]]:
     return normalize_gemini_web_cookies_from_parsed(data)
 
 
+def list_profile_ids_with_valid_cookies() -> list[str]:
+    if not PROFILES_ROOT.is_dir():
+        return []
+    found: list[str] = []
+    for p in PROFILES_ROOT.iterdir():
+        if not p.is_dir():
+            continue
+        name = p.name
+        if not _PROFILE_ID_RE.match(name):
+            continue
+        ck = load_cookies_json_file(p / "cookies.json")
+        if ck and ck.get("__Secure-1PSID"):
+            found.append(name)
+    return found
+
+
+def _pick_random_profile_id() -> str:
+    candidates = list_profile_ids_with_valid_cookies()
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="No profiles with saved cookies under profiles root. "
+            "Add cookies via POST /admin/api/profiles/{id}/cookies first.",
+        )
+    return secrets.choice(candidates)
+
+
+def resolve_v1_profile(x_gemini_profile: Optional[str]) -> str:
+    """
+    If header is omitted, uses GEMINI_V1_DEFAULT_PROFILE (default name 'default').
+    Values 'random', 'any', '*' pick a random profile that has valid on-disk cookies.
+    """
+    h = (x_gemini_profile or "").strip()
+    if not h:
+        h = (os.environ.get("GEMINI_V1_DEFAULT_PROFILE") or "default").strip() or "default"
+    if h.lower() in _PROFILE_RANDOM_ALIASES:
+        return _pick_random_profile_id()
+    return _sanitize_profile_id(h)
+
+
 def save_cookies_json_file(path: Path, cookie_map: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     payload = {
@@ -175,7 +248,7 @@ def resolve_cookies_for_request(
     profile_id: str,
     body_cookies: Optional[dict[str, Any]],
 ) -> dict[str, str]:
-    disk_path = profile_data_dir(profile_id) / "cookies.json"
+    disk_path = profile_root_dir(profile_id) / "cookies.json"
     from_disk = load_cookies_json_file(disk_path)
     from_body = None
     if body_cookies:
@@ -256,7 +329,10 @@ class ImagePart(BaseModel):
 
 
 class CookiesBody(BaseModel):
-    cookies: dict[str, Any] = Field(default_factory=dict)
+    cookies: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Optional. Omit or null to use only cookies saved for the profile on disk.",
+    )
 
 
 class GenerateRequest(CookiesBody):
@@ -366,7 +442,13 @@ async def _get_or_create_client(profile_id: str, ck: dict[str, str]) -> Any:
         psid, psidts = _psid_pair(ck)
         client = GeminiClient(psid, psidts, proxy=None)
         apply_cookie_string_map_to_gemini_client(client, ck)
-        await client.init(timeout=120, auto_close=False, close_delay=300, auto_refresh=True)
+        await client.init(
+            timeout=120,
+            auto_close=False,
+            close_delay=300,
+            auto_refresh=GEMINI_AUTO_ROTATE,
+            refresh_interval=GEMINI_REFRESH_INTERVAL_SECONDS,
+        )
         _singleton_clients[pid] = client
         _singleton_ids[pid] = cid
         p = profile_data_dir(pid) / "cookies.json"
@@ -416,6 +498,8 @@ async def health() -> dict[str, Any]:
         "profilesRoot": str(PROFILES_ROOT),
         "clientKeyRequired": bool(OPTIONAL_CLIENT_KEY),
         "adminConfigured": bool(ADMIN_API_KEY),
+        "autoRotate": GEMINI_AUTO_ROTATE,
+        "refreshIntervalSeconds": GEMINI_REFRESH_INTERVAL_SECONDS,
     }
 
 
@@ -452,18 +536,20 @@ async def admin_server_info(authorization: Optional[str] = Header(None)) -> dict
         "geminiWebapiVersion": ver,
         "clientKeyRequired": bool(OPTIONAL_CLIENT_KEY),
         "adminConfigured": bool(ADMIN_API_KEY),
+        "autoRotate": GEMINI_AUTO_ROTATE,
+        "refreshIntervalSeconds": GEMINI_REFRESH_INTERVAL_SECONDS,
     }
 
 
 @app.post("/v1/list-models")
 async def list_models(
     body: CookiesBody,
-    x_gemini_profile: str = Header("default", alias="X-Gemini-Profile"),
+    x_gemini_profile: Optional[str] = Header(None, alias="X-Gemini-Profile"),
     x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
 ) -> dict[str, Any]:
     _check_optional_client_key(x_gemini_api_key)
-    pid = _sanitize_profile_id(x_gemini_profile)
-    ck = resolve_cookies_for_request(pid, body.cookies if body.cookies else None)
+    pid = resolve_v1_profile(x_gemini_profile)
+    ck = resolve_cookies_for_request(pid, body.cookies)
 
     async def do_list(client: Any) -> dict[str, Any]:
         lm = getattr(client, "list_models", None)
@@ -478,7 +564,7 @@ async def list_models(
                 mid = getattr(m, "model_name", None) or getattr(m, "name", None) or str(m)
                 label = getattr(m, "display_name", None) or getattr(m, "label", None) or mid
                 out.append({"id": str(mid), "label": str(label)})
-        return {"models": out}
+        return {"models": out, "profile": pid}
 
     try:
         return await _run_with_client(pid, ck, do_list)
@@ -492,12 +578,12 @@ async def list_models(
 @app.post("/v1/generate")
 async def generate(
     body: GenerateRequest,
-    x_gemini_profile: str = Header("default", alias="X-Gemini-Profile"),
+    x_gemini_profile: Optional[str] = Header(None, alias="X-Gemini-Profile"),
     x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
 ) -> dict[str, Any]:
     _check_optional_client_key(x_gemini_api_key)
-    pid = _sanitize_profile_id(x_gemini_profile)
-    ck = resolve_cookies_for_request(pid, body.cookies if body.cookies else None)
+    pid = resolve_v1_profile(x_gemini_profile)
+    ck = resolve_cookies_for_request(pid, body.cookies)
 
     prompt = body.prompt or ""
     if body.responseMimeType == "application/json":
@@ -537,7 +623,7 @@ async def generate(
         text = getattr(out, "text", None)
         if text is None:
             text = str(out)
-        return {"text": text or ""}
+        return {"text": text or "", "profile": pid}
 
     try:
         return await _run_with_client(pid, ck, do_gen)
@@ -557,12 +643,12 @@ async def generate(
 @app.post("/v1/status")
 async def status(
     body: CookiesBody,
-    x_gemini_profile: str = Header("default", alias="X-Gemini-Profile"),
+    x_gemini_profile: Optional[str] = Header(None, alias="X-Gemini-Profile"),
     x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
 ) -> dict[str, Any]:
     _check_optional_client_key(x_gemini_api_key)
-    pid = _sanitize_profile_id(x_gemini_profile)
-    ck = resolve_cookies_for_request(pid, body.cookies if body.cookies else None)
+    pid = resolve_v1_profile(x_gemini_profile)
+    ck = resolve_cookies_for_request(pid, body.cookies)
 
     async def do_status(client: Any) -> dict[str, Any]:
         status_obj = getattr(client, "account_status", None)
@@ -573,11 +659,13 @@ async def status(
                 "authenticated": str(name).upper() != "UNAUTHENTICATED",
                 "status": name,
                 "description": desc,
+                "profile": pid,
             }
         return {
             "authenticated": True,
             "status": "UNKNOWN",
             "description": "client initialized (no account_status on client)",
+            "profile": pid,
         }
 
     try:
