@@ -255,9 +255,25 @@ def resolve_cookies_for_request(
         from_body = normalize_gemini_web_cookies_from_parsed(body_cookies)
     merged = merge_maps(from_disk, from_body)
     if not merged or not merged.get("__Secure-1PSID"):
+        disk_exists = disk_path.is_file()
+        disk_ok = bool(from_disk and from_disk.get("__Secure-1PSID"))
+        log.warning(
+            "resolve_cookies: no __Secure-1PSID after merge profile=%s path=%s file_exists=%s disk_ok=%s",
+            profile_id,
+            disk_path,
+            disk_exists,
+            disk_ok,
+        )
         raise HTTPException(
             status_code=400,
-            detail="Missing cookies: set cookies via POST /admin/api/profiles/{id}/cookies or include cookies in the JSON body.",
+            detail=(
+                f"Missing cookies for profile {profile_id!r}. "
+                f"On-disk path: {disk_path.resolve()} (file exists={disk_exists}, "
+                f"loaded valid __Secure-1PSID from disk={disk_ok}). "
+                "If /ui shows cookies saved, use the same server URL, pick that account in the tester, "
+                "or send header X-Gemini-Profile matching that profile (default profile id is 'default'). "
+                "Otherwise set cookies via POST /admin/api/profiles/{id}/cookies or include cookies in the JSON body."
+            ),
         )
     return merged
 

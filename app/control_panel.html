@@ -361,6 +361,20 @@
     el.style.color = isErr ? 'var(--err)' : 'var(--muted)';
   }
 
+  /** Pretty-print FastAPI error bodies (string detail, object detail, or validation array). */
+  function formatApiError(rawText, parsed) {
+    if (parsed && typeof parsed.detail === 'object' && parsed.detail !== null) {
+      if (Array.isArray(parsed.detail)) {
+        return JSON.stringify(parsed.detail, null, 2);
+      }
+      return JSON.stringify(parsed.detail, null, 2);
+    }
+    if (typeof parsed?.detail === 'string') {
+      return parsed.detail;
+    }
+    return rawText;
+  }
+
   function resetModelSelect() {
     const sel = $('modelSelect');
     sel.innerHTML = '';
@@ -453,14 +467,15 @@
       const r = await fetch('/v1/list-models', {
         method: 'POST',
         headers: v1Headers(p),
-        body: JSON.stringify({ cookies: {} }),
+        body: JSON.stringify({}),
       });
       const raw = await r.text();
       let j;
       try { j = JSON.parse(raw); } catch (_) { j = { detail: raw }; }
       if (!r.ok) {
-        setModelHintError(j.detail || raw || r.status);
-        $('outPlay').textContent = typeof j.detail === 'string' ? j.detail : raw;
+        const full = formatApiError(raw, j);
+        $('outPlay').textContent = full;
+        setModelHintError(full.length > 220 ? full.slice(0, 220) + '… (see Response)' : full, true);
         return;
       }
       const models = j.models || [];
@@ -499,10 +514,12 @@
       const r = await fetch('/v1/status', {
         method: 'POST',
         headers: v1Headers(p),
-        body: JSON.stringify({ cookies: {} }),
+        body: JSON.stringify({}),
       });
       const t = await r.text();
-      $('outPlay').textContent = t;
+      let j;
+      try { j = JSON.parse(t); } catch (_) { j = null; }
+      $('outPlay').textContent = j && !r.ok ? formatApiError(t, j) : t;
     } catch (e) {
       $('outPlay').textContent = String(e);
     }
@@ -514,7 +531,7 @@
     const custom = $('playModelCustom').value.trim();
     const fromSelect = $('modelSelect').value.trim();
     $('outPlay').textContent = '…';
-    const body = { prompt, cookies: {} };
+    const body = { prompt };
     const model = custom || fromSelect;
     if (model) body.model = model;
     try {
