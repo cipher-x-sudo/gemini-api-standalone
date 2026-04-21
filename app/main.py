@@ -30,7 +30,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 if sys.version_info < (3, 11) and not hasattr(enum, "StrEnum"):
 
@@ -593,7 +593,36 @@ async def status(
 
 
 class CookiesPayload(BaseModel):
-    cookies: dict[str, Any]
+    """
+    Accepts:
+    - {"cookies": {"__Secure-1PSID": "..."}}  (flat map)
+    - {"cookies": [{"name","value"}, ...]}   (browser extension array)
+    - {"__Secure-1PSID": "..."}              (flat map at root — common paste mistake)
+    - [{"name","value"}, ...]               (raw array body)
+    """
+
+    cookies: dict[str, Any] | list[Any]
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_cookie_body(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"cookies": data}
+        if not isinstance(data, dict):
+            return data
+        if "cookies" in data:
+            return data
+        if any(
+            k in data
+            for k in (
+                "__Secure-1PSID",
+                "__Secure-3PSID",
+                "__Secure-1PSIDTS",
+                "__Secure-3PSIDTS",
+            )
+        ):
+            return {"cookies": data}
+        return data
 
 
 class CreateProfilePayload(BaseModel):
