@@ -1,0 +1,1 @@
+# Gemini API standalone package

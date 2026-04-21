@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Env & secrets
+.env
+!.env.example
+
+# Local data (when running without Docker volume)
+data/
+
+# OS / editor
+.DS_Store
+.idea/
+*.swp

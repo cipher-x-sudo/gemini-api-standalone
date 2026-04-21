@@ -1,0 +1,669 @@
+"""
+Standalone Gemini Web API (gemini_webapi) for VPS/Docker.
+
+- Per-profile cookie dirs under GEMINI_PROFILES_ROOT; each sets GEMINI_COOKIE_PATH so the library
+  persists rotated cookies (see gemini_webapi rotate_1psidts / save_cookies).
+- Nexus-compatible routes: POST /v1/list-models, /v1/generate, /v1/status (cookies in body or on-disk).
+- Admin: paste cookies per profile (Bearer ADMIN_API_KEY).
+
+Set ADMIN_API_KEY and put the service behind Cloudflare Access or a private network.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import enum
+import json
+import logging
+import mimetypes
+import os
+import re
+import sys
+import shutil
+import tempfile
+import traceback
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
+
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
+
+if sys.version_info < (3, 11) and not hasattr(enum, "StrEnum"):
+
+    class StrEnum(str, enum.Enum):
+        pass
+
+    enum.StrEnum = StrEnum  # type: ignore[attr-defined, assignment]
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("gemini-api-standalone")
+
+PROFILES_ROOT = Path(os.environ.get("GEMINI_PROFILES_ROOT", "/data/profiles")).resolve()
+ADMIN_API_KEY = (os.environ.get("ADMIN_API_KEY") or "").strip()
+OPTIONAL_CLIENT_KEY = (os.environ.get("GEMINI_API_CLIENT_KEY") or "").strip()
+
+_PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
+
+_CONTROL_PANEL_HTML = Path(__file__).resolve().parent / "control_panel.html"
+
+
+def _mask_cookie_value(v: str, prefix: int = 6, suffix: int = 4) -> str:
+    t = (v or "").strip()
+    if len(t) <= prefix + suffix:
+        return "***"
+    return f"{t[:prefix]}…{t[-suffix:]}"
+
+
+def _mask_cookie_map_for_display(ck: dict[str, str]) -> dict[str, str]:
+    return {k: _mask_cookie_value(v) for k, v in sorted(ck.items())}
+
+
+def _sanitize_profile_id(raw: str) -> str:
+    t = (raw or "").strip()
+    if not t:
+        return "default"
+    if not _PROFILE_ID_RE.match(t):
+        raise HTTPException(status_code=400, detail="Invalid X-Gemini-Profile (use letters, digits, ._-)")
+    return t
+
+
+def profile_data_dir(profile_id: str) -> Path:
+    d = PROFILES_ROOT / _sanitize_profile_id(profile_id)
+    d.mkdir(parents=True, mode=0o700, exist_ok=True)
+    return d
+
+
+def _set_gemini_cookie_path_for_profile(profile_id: str) -> Path:
+    d = profile_data_dir(profile_id)
+    os.environ["GEMINI_COOKIE_PATH"] = str(d)
+    return d
+
+
+def normalize_gemini_web_cookies_from_parsed(parsed: Any) -> Optional[dict[str, str]]:
+    if parsed is None:
+        return None
+    out: dict[str, str] = {}
+
+    def put(name: str, value: Any) -> None:
+        if not isinstance(name, str):
+            return
+        v = value if isinstance(value, str) else str(value or "")
+        v = v.strip()
+        if not v:
+            return
+        n = name.strip()
+        if n == "__Secure-1PSID":
+            out["__Secure-1PSID"] = v
+            return
+        if n == "__Secure-3PSID":
+            if "__Secure-1PSID" not in out:
+                out["__Secure-1PSID"] = v
+            return
+        if n == "__Secure-1PSIDTS":
+            out["__Secure-1PSIDTS"] = v
+            return
+        if n == "__Secure-3PSIDTS":
+            if "__Secure-1PSIDTS" not in out:
+                out["__Secure-1PSIDTS"] = v
+            return
+        if n not in out:
+            out[n] = v
+
+    if isinstance(parsed, dict):
+        for k, val in parsed.items():
+            if k in ("__Secure-1PSID", "__Secure-3PSID", "__Secure-1PSIDTS", "__Secure-3PSIDTS"):
+                put(k, val)
+                continue
+            if isinstance(val, dict) and isinstance(val.get("name"), str):
+                put(str(val["name"]), val.get("value"))
+                continue
+            if isinstance(val, str):
+                put(str(k), val)
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                put(str(item["name"]), item.get("value"))
+
+    if "__Secure-1PSID" not in out:
+        return None
+    return out
+
+
+def load_cookies_json_file(path: Path) -> Optional[dict[str, str]]:
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if isinstance(data, dict) and "cookies" in data and isinstance(data["cookies"], (dict, list)):
+        return normalize_gemini_web_cookies_from_parsed(data["cookies"])
+    return normalize_gemini_web_cookies_from_parsed(data)
+
+
+def save_cookies_json_file(path: Path, cookie_map: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    payload = {
+        "cookies": cookie_map,
+        "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def merge_maps(base: Optional[dict[str, str]], overlay: Optional[dict[str, str]]) -> Optional[dict[str, str]]:
+    if not base:
+        return dict(overlay) if overlay else None
+    if not overlay:
+        return dict(base)
+    m = dict(base)
+    m.update(overlay)
+    return m
+
+
+def resolve_cookies_for_request(
+    profile_id: str,
+    body_cookies: Optional[dict[str, Any]],
+) -> dict[str, str]:
+    disk_path = profile_data_dir(profile_id) / "cookies.json"
+    from_disk = load_cookies_json_file(disk_path)
+    from_body = None
+    if body_cookies:
+        from_body = normalize_gemini_web_cookies_from_parsed(body_cookies)
+    merged = merge_maps(from_disk, from_body)
+    if not merged or not merged.get("__Secure-1PSID"):
+        raise HTTPException(
+            status_code=400,
+            detail="Missing cookies: set cookies via POST /admin/api/profiles/{id}/cookies or include cookies in the JSON body.",
+        )
+    return merged
+
+
+def apply_cookie_string_map_to_gemini_client(client: Any, cookie_map: dict[str, str]) -> None:
+    jar = getattr(client, "_cookies", None)
+    if jar is None:
+        return
+    setfn = getattr(jar, "set", None)
+    if not callable(setfn):
+        return
+    for name, value in cookie_map.items():
+        if not name or not str(value).strip():
+            continue
+        v = str(value).strip()
+        try:
+            setfn(name, v, domain=".google.com")
+        except Exception:
+            try:
+                setfn(name, v, domain=".gemini.google.com")
+            except Exception:
+                pass
+
+
+def extract_flat_cookie_map_from_client(client: Any) -> dict[str, str]:
+    jar = getattr(client, "_cookies", None)
+    if jar is None:
+        return {}
+    out: dict[str, str] = {}
+    try:
+        inner = getattr(jar, "jar", None)
+        if inner is not None:
+            for cookie in inner:
+                name = getattr(cookie, "name", None)
+                val = getattr(cookie, "value", None)
+                if name and val is not None:
+                    out[str(name)] = str(val)
+    except Exception:
+        pass
+    return out
+
+
+def _psid_pair(ck: dict[str, str]) -> tuple[str, str]:
+    psid = (ck.get("__Secure-1PSID") or "").strip()
+    psidts = (ck.get("__Secure-1PSIDTS") or "").strip()
+    if not psid:
+        raise HTTPException(status_code=400, detail="Missing __Secure-1PSID in cookie map.")
+    return psid, psidts
+
+
+async def _maybe_await_close(client: Any) -> None:
+    closer = getattr(client, "close", None)
+    if not callable(closer):
+        return
+    try:
+        r = closer()
+        if asyncio.iscoroutine(r):
+            await r
+    except Exception:
+        pass
+
+
+# --- FastAPI models (Nexus bridge compatible) ---
+
+
+class ImagePart(BaseModel):
+    mimeType: str = Field(..., description="e.g. image/jpeg")
+    base64: str
+
+
+class CookiesBody(BaseModel):
+    cookies: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerateRequest(CookiesBody):
+    prompt: str = ""
+    model: Optional[str] = None
+    responseMimeType: Optional[str] = None
+    images: Optional[list[ImagePart]] = None
+
+
+# --- Auth ---
+
+
+def _check_admin(authorization: Optional[str]) -> None:
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="ADMIN_API_KEY is not configured on the server.")
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if token != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin token.")
+
+
+def _check_optional_client_key(x_client_key: Optional[str]) -> None:
+    if not OPTIONAL_CLIENT_KEY:
+        return
+    if (x_client_key or "").strip() != OPTIONAL_CLIENT_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Gemini-Api-Key.")
+
+
+# --- Gemini ops ---
+
+
+def _gemini_web_model_is_known(name: str) -> bool:
+    try:
+        from gemini_webapi.constants import Model
+
+        Model.from_name(name)
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_model_for_gemini_web(requested: str) -> str | None:
+    m0 = requested.strip()
+    if not m0 or m0.lower() == "unspecified":
+        return None
+    legacy: dict[str, str] = {
+        "gemini-2.5-pro": "gemini-3-pro",
+        "gemini-2.5-flash": "gemini-3-flash",
+        "gemini-2.5-flash-lite": "gemini-3-flash",
+    }
+    catalog_hint: dict[str, str] = {
+        "gemini-3.1-pro-low": "gemini-3-pro",
+        "gemini-3.1-pro-high": "gemini-3-pro-plus",
+    }
+    variants: list[str] = [m0]
+    if m0 in legacy:
+        variants.append(legacy[m0])
+    if m0 in catalog_hint:
+        variants.append(catalog_hint[m0])
+    if m0.endswith("-preview"):
+        base = m0[: -len("-preview")]
+        variants.extend([base, legacy.get(base, base), catalog_hint.get(base, base)])
+    seen: set[str] = set()
+    for t in variants:
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        if _gemini_web_model_is_known(t):
+            return t
+    for fb in ("gemini-3-pro", "gemini-3-flash"):
+        if _gemini_web_model_is_known(fb):
+            return fb
+    return m0
+
+
+_singleton_clients: dict[str, Any] = {}
+_singleton_locks: dict[str, asyncio.Lock] = {}
+_singleton_ids: dict[str, str] = {}
+
+
+def _cookie_identity_hash(ck: dict[str, str]) -> str:
+    import hashlib
+
+    items = sorted(ck.items())
+    return hashlib.sha256(json.dumps(items, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+async def _get_or_create_client(profile_id: str, ck: dict[str, str]) -> Any:
+    from gemini_webapi import GeminiClient
+
+    _set_gemini_cookie_path_for_profile(profile_id)
+    pid = _sanitize_profile_id(profile_id)
+    cid = _cookie_identity_hash(ck)
+    if pid not in _singleton_locks:
+        _singleton_locks[pid] = asyncio.Lock()
+    lock = _singleton_locks[pid]
+    async with lock:
+        cur = _singleton_clients.get(pid)
+        cur_sig = _singleton_ids.get(pid)
+        if cur is not None and cur_sig == cid:
+            apply_cookie_string_map_to_gemini_client(cur, ck)
+            return cur
+        if cur is not None:
+            await _maybe_await_close(cur)
+            _singleton_clients.pop(pid, None)
+        psid, psidts = _psid_pair(ck)
+        client = GeminiClient(psid, psidts, proxy=None)
+        apply_cookie_string_map_to_gemini_client(client, ck)
+        await client.init(timeout=120, auto_close=False, close_delay=300, auto_refresh=True)
+        _singleton_clients[pid] = client
+        _singleton_ids[pid] = cid
+        p = profile_data_dir(pid) / "cookies.json"
+        flat = extract_flat_cookie_map_from_client(client)
+        norm = normalize_gemini_web_cookies_from_parsed(flat)
+        if norm:
+            save_cookies_json_file(p, norm)
+        return client
+
+
+async def _run_with_client(
+    profile_id: str,
+    ck: dict[str, str],
+    op: Callable[[Any], Awaitable[Any]],
+) -> Any:
+    client = await _get_or_create_client(profile_id, ck)
+    try:
+        return await op(client)
+    finally:
+        flat = extract_flat_cookie_map_from_client(client)
+        norm = normalize_gemini_web_cookies_from_parsed(flat)
+        if norm:
+            save_cookies_json_file(profile_data_dir(profile_id) / "cookies.json", norm)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    PROFILES_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if not ADMIN_API_KEY:
+        log.warning("ADMIN_API_KEY is empty — admin routes disabled until set.")
+    yield
+    for pid, c in list(_singleton_clients.items()):
+        try:
+            await _maybe_await_close(c)
+        except Exception:
+            pass
+    _singleton_clients.clear()
+
+
+app = FastAPI(title="Gemini Web API (standalone)", version="1.0.0", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "profilesRoot": str(PROFILES_ROOT),
+        "clientKeyRequired": bool(OPTIONAL_CLIENT_KEY),
+        "adminConfigured": bool(ADMIN_API_KEY),
+    }
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/ui", status_code=302)
+
+
+@app.get("/ui", response_class=HTMLResponse)
+async def control_panel_ui() -> HTMLResponse:
+    try:
+        return HTMLResponse(_CONTROL_PANEL_HTML.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise HTTPException(status_code=503, detail=f"control_panel.html not readable: {e}") from e
+
+
+@app.get("/admin", include_in_schema=False)
+async def admin_redirect_to_ui() -> RedirectResponse:
+    return RedirectResponse(url="/ui", status_code=302)
+
+
+@app.get("/admin/api/server")
+async def admin_server_info(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    _check_admin(authorization)
+    try:
+        import gemini_webapi
+
+        ver = getattr(gemini_webapi, "__version__", None) or "unknown"
+    except Exception:
+        ver = "unknown"
+    return {
+        "service": "gemini-api-standalone",
+        "profilesRoot": str(PROFILES_ROOT),
+        "geminiWebapiVersion": ver,
+        "clientKeyRequired": bool(OPTIONAL_CLIENT_KEY),
+        "adminConfigured": bool(ADMIN_API_KEY),
+    }
+
+
+@app.post("/v1/list-models")
+async def list_models(
+    body: CookiesBody,
+    x_gemini_profile: str = Header("default", alias="X-Gemini-Profile"),
+    x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
+) -> dict[str, Any]:
+    _check_optional_client_key(x_gemini_api_key)
+    pid = _sanitize_profile_id(x_gemini_profile)
+    ck = resolve_cookies_for_request(pid, body.cookies if body.cookies else None)
+
+    async def do_list(client: Any) -> dict[str, Any]:
+        lm = getattr(client, "list_models", None)
+        if not callable(lm):
+            raise HTTPException(status_code=501, detail="gemini_webapi client has no list_models")
+        raw = lm()
+        if asyncio.iscoroutine(raw):
+            raw = await raw
+        out: list[dict[str, str]] = []
+        if raw:
+            for m in raw:
+                mid = getattr(m, "model_name", None) or getattr(m, "name", None) or str(m)
+                label = getattr(m, "display_name", None) or getattr(m, "label", None) or mid
+                out.append({"id": str(mid), "label": str(label)})
+        return {"models": out}
+
+    try:
+        return await _run_with_client(pid, ck, do_list)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=str(e) or "list_models failed") from e
+
+
+@app.post("/v1/generate")
+async def generate(
+    body: GenerateRequest,
+    x_gemini_profile: str = Header("default", alias="X-Gemini-Profile"),
+    x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
+) -> dict[str, Any]:
+    _check_optional_client_key(x_gemini_api_key)
+    pid = _sanitize_profile_id(x_gemini_profile)
+    ck = resolve_cookies_for_request(pid, body.cookies if body.cookies else None)
+
+    prompt = body.prompt or ""
+    if body.responseMimeType == "application/json":
+        prompt = (
+            prompt
+            + "\n\nReturn ONLY valid JSON. No markdown fences or text outside the JSON object or array."
+        )
+
+    temp_paths: list[str] = []
+    for im in body.images or []:
+        ext = mimetypes.guess_extension(im.mimeType.split(";")[0].strip()) or ".bin"
+        fd, path = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        try:
+            data = base64.b64decode(im.base64, validate=False)
+        except Exception as e:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}") from e
+        with open(path, "wb") as f:
+            f.write(data)
+        temp_paths.append(path)
+
+    async def do_gen(client: Any) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        m = body.model
+        if m and str(m).strip() and str(m).strip().lower() != "unspecified":
+            resolved = _normalize_model_for_gemini_web(str(m).strip())
+            if resolved:
+                kwargs["model"] = resolved
+        if temp_paths:
+            out = await client.generate_content(prompt, files=temp_paths, **kwargs)
+        else:
+            out = await client.generate_content(prompt, **kwargs)
+        text = getattr(out, "text", None)
+        if text is None:
+            text = str(out)
+        return {"text": text or ""}
+
+    try:
+        return await _run_with_client(pid, ck, do_gen)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=str(e) or "Gemini Web generation failed") from e
+    finally:
+        for p in temp_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+@app.post("/v1/status")
+async def status(
+    body: CookiesBody,
+    x_gemini_profile: str = Header("default", alias="X-Gemini-Profile"),
+    x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
+) -> dict[str, Any]:
+    _check_optional_client_key(x_gemini_api_key)
+    pid = _sanitize_profile_id(x_gemini_profile)
+    ck = resolve_cookies_for_request(pid, body.cookies if body.cookies else None)
+
+    async def do_status(client: Any) -> dict[str, Any]:
+        status_obj = getattr(client, "account_status", None)
+        if status_obj is not None:
+            name = getattr(status_obj, "name", None) or str(status_obj)
+            desc = (getattr(status_obj, "description", "") or "").strip()
+            return {
+                "authenticated": str(name).upper() != "UNAUTHENTICATED",
+                "status": name,
+                "description": desc,
+            }
+        return {
+            "authenticated": True,
+            "status": "UNKNOWN",
+            "description": "client initialized (no account_status on client)",
+        }
+
+    try:
+        return await _run_with_client(pid, ck, do_status)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=str(e) or "Status check failed") from e
+
+
+# --- Admin ---
+
+
+class CookiesPayload(BaseModel):
+    cookies: dict[str, Any]
+
+
+class CreateProfilePayload(BaseModel):
+    profileId: str = Field(..., min_length=1, max_length=63)
+
+
+@app.get("/admin/api/profiles/{profile_id}/cookies")
+async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    _check_admin(authorization)
+    pid = _sanitize_profile_id(profile_id)
+    path = (PROFILES_ROOT / pid / "cookies.json").resolve()
+    if not path.is_file():
+        return {"missing": True, "profile": pid}
+    ck = load_cookies_json_file(path)
+    if not ck:
+        return {"missing": True, "profile": pid}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        updated = raw.get("updatedAt") if isinstance(raw, dict) else None
+    except (json.JSONDecodeError, OSError):
+        updated = None
+    return {
+        "profile": pid,
+        "updatedAt": updated,
+        "cookiesMasked": _mask_cookie_map_for_display(ck),
+    }
+
+
+@app.post("/admin/api/profiles")
+async def admin_create_profile(body: CreateProfilePayload, authorization: Optional[str] = Header(None)) -> JSONResponse:
+    _check_admin(authorization)
+    pid = _sanitize_profile_id(body.profileId.strip())
+    profile_data_dir(pid)
+    return JSONResponse({"ok": True, "profile": pid})
+
+
+@app.delete("/admin/api/profiles/{profile_id}")
+async def admin_delete_profile(profile_id: str, authorization: Optional[str] = Header(None)) -> JSONResponse:
+    _check_admin(authorization)
+    pid = _sanitize_profile_id(profile_id)
+    if pid in _singleton_clients:
+        c = _singleton_clients.pop(pid)
+        await _maybe_await_close(c)
+    _singleton_ids.pop(pid, None)
+    d = PROFILES_ROOT / pid
+    if d.is_dir():
+        shutil.rmtree(d, ignore_errors=True)
+    return JSONResponse({"ok": True, "deleted": pid})
+
+
+@app.post("/admin/api/profiles/{profile_id}/cookies")
+async def admin_save_cookies(profile_id: str, body: CookiesPayload, authorization: Optional[str] = Header(None)) -> JSONResponse:
+    _check_admin(authorization)
+    pid = _sanitize_profile_id(profile_id)
+    ck = normalize_gemini_web_cookies_from_parsed(body.cookies)
+    if not ck:
+        raise HTTPException(status_code=400, detail="Could not normalize cookies (need __Secure-1PSID).")
+    save_cookies_json_file(profile_data_dir(pid) / "cookies.json", ck)
+    # Drop cached client for this profile so next request re-inits with new cookies
+    if pid in _singleton_clients:
+        c = _singleton_clients.pop(pid)
+        await _maybe_await_close(c)
+    _singleton_ids.pop(pid, None)
+    return JSONResponse({"ok": True, "profile": pid})
+
+
+@app.get("/admin/api/profiles")
+async def admin_list_profiles(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    _check_admin(authorization)
+    if not PROFILES_ROOT.is_dir():
+        return {"profiles": []}
+    names = sorted([p.name for p in PROFILES_ROOT.iterdir() if p.is_dir()])
+    return {"profiles": names}
