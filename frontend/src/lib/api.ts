@@ -1,4 +1,5 @@
-const API_BASE = "http://localhost:8000";
+/** Same origin as the UI when served from FastAPI (/ui). Override at build time if the API is on another origin. */
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, "") ?? "";
 
 export function getAdminKey() {
   return localStorage.getItem("ADMIN_API_KEY") || "";
