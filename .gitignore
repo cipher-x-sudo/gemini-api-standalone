@@ -5,7 +5,7 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
-frontend
+
 # Env & secrets
 .env
 !.env.example
@@ -17,3 +17,4 @@ data/
 .DS_Store
 .idea/
 *.swp
+frontend

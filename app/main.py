@@ -32,6 +32,8 @@ from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 if sys.version_info < (3, 11) and not hasattr(enum, "StrEnum"):
@@ -409,6 +411,16 @@ def _http_exception_from_upstream(profile: str, exc: BaseException) -> HTTPExcep
     return HTTPException(status_code=502, detail=prefix + msg)
 
 
+def _raise_mapped_upstream(profile: str, exc: BaseException) -> None:
+    """Raise HTTPException from gemini_webapi; log full traceback only for mapped 5xx responses."""
+    he = _http_exception_from_upstream(profile, exc)
+    if he.status_code >= 500:
+        traceback.print_exc()
+    else:
+        log.warning("upstream profile=%s -> HTTP %s: %s", profile, he.status_code, exc)
+    raise he from exc
+
+
 def _account_status_fields_from_client(client: Any) -> dict[str, Any]:
     status_obj = getattr(client, "account_status", None)
     if status_obj is not None:
@@ -608,6 +620,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Gemini Web API (standalone)", version="1.0.0", lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
@@ -689,8 +709,7 @@ async def list_models(
     except HTTPException:
         raise
     except Exception as e:
-        traceback.print_exc()
-        raise _http_exception_from_upstream(pid, e) from e
+        _raise_mapped_upstream(pid, e)
 
 
 @app.post("/v1/generate")
@@ -748,8 +767,7 @@ async def generate(
     except HTTPException:
         raise
     except Exception as e:
-        traceback.print_exc()
-        raise _http_exception_from_upstream(pid, e) from e
+        _raise_mapped_upstream(pid, e)
     finally:
         for p in temp_paths:
             try:
@@ -777,8 +795,7 @@ async def status(
     except HTTPException:
         raise
     except Exception as e:
-        traceback.print_exc()
-        raise _http_exception_from_upstream(pid, e) from e
+        _raise_mapped_upstream(pid, e)
 
 
 # --- Admin ---
