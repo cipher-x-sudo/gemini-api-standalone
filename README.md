@@ -99,6 +99,19 @@ Unless noted, JSON bodies use `Content-Type: application/json`.
 
 **Profile selection:** header **`X-Gemini-Profile`** (optional). If you omit it, the server uses **`GEMINI_V1_DEFAULT_PROFILE`** (default profile name **`default`**). To use a **random** account among those that already have saved cookies, send **`X-Gemini-Profile: random`** (also accepted: `any`, `*`) or set **`GEMINI_V1_DEFAULT_PROFILE=random`**. Responses include **`profile`** so you can see which profile was used (including after a random pick).
 
+**Random profile for a single job (per request):** send the header on every `/v1` call — the server picks one profile at random from those that already have valid `cookies.json`. Synonyms: `random`, `any`, `*` (case-insensitive).
+
+```bash
+# Example: generate using a random saved account (read profile id from JSON response)
+curl -sS -X POST "$BASE/v1/generate" \
+  -H "Content-Type: application/json" \
+  -H "X-Gemini-Profile: random" \
+  -H "X-Gemini-Api-Key: $GEMINI_API_CLIENT_KEY" \
+  -d '{"prompt":"Hello"}'
+```
+
+**Random by default (no header):** set **`GEMINI_V1_DEFAULT_PROFILE=random`** in `.env` so omitting `X-Gemini-Profile` also selects a random profile each time.
+
 If **`GEMINI_API_CLIENT_KEY`** is set, every request must include **`X-Gemini-Api-Key`** with that value.
 
 | Method | Path | Body | Description |
@@ -119,6 +132,9 @@ Send **`Authorization: Bearer <ADMIN_API_KEY>`**. If `ADMIN_API_KEY` is unset, t
 | `DELETE` | `/admin/api/profiles/{profile_id}` | — | Deletes profile data and closes cached client. |
 | `GET` | `/admin/api/profiles/{profile_id}/cookies` | — | Masked cookies + `updatedAt` (never full secrets). |
 | `POST` | `/admin/api/profiles/{profile_id}/cookies` | See `CookiesPayload` in `app/main.py` | Saves cookies for that profile; invalidates cached client. |
+| `GET` | `/admin/api/profiles/auth-status` | — | **Session health scan:** for each profile directory, loads on-disk cookies and probes Gemini Web `account_status`. Returns `authenticated`, upstream `status` (e.g. `UNAUTHENTICATED`), `NO_COOKIES`, or `PROBE_ERROR` with `httpStatus` when init fails. Can take a while if you have many accounts (per-profile timeout 120s). |
+
+**Upstream errors (`/v1/*`):** `gemini_webapi` failures are mapped when possible — e.g. Google rate limits (`Status: 429`, `UsageLimitExceeded`, `TemporarilyBlocked`) return **HTTP 429** with a clear message instead of a generic **502**. Expired/invalid sessions often surface as **401** or **503** (e.g. upstream status `0`). Use **`GET /admin/api/profiles/auth-status`** or **`POST /v1/status`** to confirm which profiles need fresh cookies.
 
 OpenAPI (Swagger) is available at **`/docs`** when the app is running.
 

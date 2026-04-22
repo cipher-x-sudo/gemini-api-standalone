@@ -4,8 +4,8 @@ Standalone Gemini Web API (gemini_webapi) for VPS/Docker.
 - Per-profile cookie dirs under GEMINI_PROFILES_ROOT; each sets GEMINI_COOKIE_PATH so the library
   persists rotated cookies (gemini_webapi background task: rotate_1psidts / save_cookies).
 - Optional env: GEMINI_AUTO_ROTATE (or GEMINI_AUTO_REFRESH), GEMINI_REFRESH_INTERVAL_SECONDS.
-- Nexus-compatible routes: POST /v1/list-models, /v1/generate, /v1/status (cookies optional if on-disk; X-Gemini-Profile: random or GEMINI_V1_DEFAULT_PROFILE=random).
-- Admin: paste cookies per profile (Bearer ADMIN_API_KEY).
+- Nexus-compatible routes: POST /v1/list-models, /v1/generate, /v1/status (cookies optional if on-disk; X-Gemini-Profile: random or GEMINI_V1_DEFAULT_PROFILE=random). Upstream gemini_webapi errors map to HTTP 429/401/503 where applicable.
+- Admin: paste cookies per profile (Bearer ADMIN_API_KEY); GET /admin/api/profiles/auth-status scans all profiles’ session health.
 
 Set ADMIN_API_KEY and put the service behind Cloudflare Access or a private network.
 """
@@ -336,6 +336,108 @@ async def _maybe_await_close(client: Any) -> None:
         pass
 
 
+def _parse_http_status_from_gemini_message(msg: str) -> int | None:
+    m = re.search(r"Status:\s*(\d+)", msg, re.I)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _http_exception_from_upstream(profile: str, exc: BaseException) -> HTTPException:
+    """
+    Map gemini_webapi exceptions to HTTP responses (e.g. 429 for rate limits, not generic 502).
+    """
+    msg = str(exc).strip() or repr(exc)
+    prefix = f"[profile={profile!r}] "
+    try:
+        from gemini_webapi.exceptions import (
+            APIError,
+            AuthError,
+            GeminiError,
+            ModelInvalid,
+            TemporarilyBlocked,
+            TimeoutError,
+            UsageLimitExceeded,
+        )
+    except ImportError:
+        code = _parse_http_status_from_gemini_message(msg)
+        if code == 429:
+            return HTTPException(status_code=429, detail=prefix + msg)
+        if code == 0:
+            return HTTPException(
+                status_code=503,
+                detail=prefix + "Upstream status 0 (network or empty response). " + msg,
+            )
+        return HTTPException(status_code=502, detail=prefix + msg)
+
+    if isinstance(exc, AuthError):
+        return HTTPException(
+            status_code=401,
+            detail=prefix + "Gemini Web session invalid (AuthError). " + msg + " Re-paste cookies in /ui for this profile.",
+        )
+    if isinstance(exc, UsageLimitExceeded):
+        return HTTPException(status_code=429, detail=prefix + msg)
+    if isinstance(exc, TemporarilyBlocked):
+        return HTTPException(status_code=429, detail=prefix + msg)
+    if isinstance(exc, ModelInvalid):
+        return HTTPException(status_code=400, detail=prefix + msg)
+    if isinstance(exc, TimeoutError):
+        return HTTPException(status_code=504, detail=prefix + msg)
+    if isinstance(exc, APIError):
+        code = _parse_http_status_from_gemini_message(msg)
+        if code == 429:
+            return HTTPException(status_code=429, detail=prefix + msg)
+        if code == 0:
+            return HTTPException(
+                status_code=503,
+                detail=prefix + "Upstream returned status 0 (network or empty response). " + msg,
+            )
+        if code is not None and 400 <= code < 500 and code not in (429,):
+            return HTTPException(
+                status_code=401,
+                detail=prefix + f"Upstream HTTP {code}. " + msg + " Cookies may be expired — refresh in /ui.",
+            )
+        if code is not None and code >= 500:
+            return HTTPException(status_code=502, detail=prefix + f"Upstream HTTP {code}. " + msg)
+        return HTTPException(status_code=502, detail=prefix + msg)
+    if isinstance(exc, GeminiError):
+        return HTTPException(status_code=502, detail=prefix + msg)
+
+    return HTTPException(status_code=502, detail=prefix + msg)
+
+
+def _account_status_fields_from_client(client: Any) -> dict[str, Any]:
+    status_obj = getattr(client, "account_status", None)
+    if status_obj is not None:
+        name = getattr(status_obj, "name", None) or str(status_obj)
+        desc = (getattr(status_obj, "description", "") or "").strip()
+        return {
+            "authenticated": str(name).upper() != "UNAUTHENTICATED",
+            "status": name,
+            "description": desc,
+        }
+    return {
+        "authenticated": True,
+        "status": "UNKNOWN",
+        "description": "client initialized (no account_status on client)",
+    }
+
+
+def list_all_profile_ids_on_disk() -> list[str]:
+    if not PROFILES_ROOT.is_dir():
+        return []
+    names: list[str] = []
+    for p in PROFILES_ROOT.iterdir():
+        if not p.is_dir():
+            continue
+        if _PROFILE_ID_RE.match(p.name):
+            names.append(p.name)
+    return sorted(names)
+
+
 # --- FastAPI models (Nexus bridge compatible) ---
 
 
@@ -588,7 +690,7 @@ async def list_models(
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=502, detail=str(e) or "list_models failed") from e
+        raise _http_exception_from_upstream(pid, e) from e
 
 
 @app.post("/v1/generate")
@@ -647,7 +749,7 @@ async def generate(
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=502, detail=str(e) or "Gemini Web generation failed") from e
+        raise _http_exception_from_upstream(pid, e) from e
     finally:
         for p in temp_paths:
             try:
@@ -667,22 +769,8 @@ async def status(
     ck = resolve_cookies_for_request(pid, body.cookies)
 
     async def do_status(client: Any) -> dict[str, Any]:
-        status_obj = getattr(client, "account_status", None)
-        if status_obj is not None:
-            name = getattr(status_obj, "name", None) or str(status_obj)
-            desc = (getattr(status_obj, "description", "") or "").strip()
-            return {
-                "authenticated": str(name).upper() != "UNAUTHENTICATED",
-                "status": name,
-                "description": desc,
-                "profile": pid,
-            }
-        return {
-            "authenticated": True,
-            "status": "UNKNOWN",
-            "description": "client initialized (no account_status on client)",
-            "profile": pid,
-        }
+        d = _account_status_fields_from_client(client)
+        return {**d, "profile": pid}
 
     try:
         return await _run_with_client(pid, ck, do_status)
@@ -690,7 +778,7 @@ async def status(
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=502, detail=str(e) or "Status check failed") from e
+        raise _http_exception_from_upstream(pid, e) from e
 
 
 # --- Admin ---
@@ -800,3 +888,83 @@ async def admin_list_profiles(authorization: Optional[str] = Header(None)) -> di
         return {"profiles": []}
     names = sorted([p.name for p in PROFILES_ROOT.iterdir() if p.is_dir()])
     return {"profiles": names}
+
+
+@app.get("/admin/api/profiles/auth-status")
+async def admin_profiles_auth_status(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """
+    Probe every profile directory: load on-disk cookies, init GeminiClient, read account_status.
+    Use this to see which accounts are UNAUTHENTICATED / rate-limited before calling /v1/generate.
+    """
+    _check_admin(authorization)
+    checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows: list[dict[str, Any]] = []
+
+    async def do_probe(client: Any) -> dict[str, Any]:
+        return _account_status_fields_from_client(client)
+
+    for pid in list_all_profile_ids_on_disk():
+        disk_path = profile_root_dir(pid) / "cookies.json"
+        ck = load_cookies_json_file(disk_path)
+        if not ck or not ck.get("__Secure-1PSID"):
+            rows.append(
+                {
+                    "profile": pid,
+                    "cookiesOnDisk": disk_path.is_file(),
+                    "diskHasValidPsid": False,
+                    "authenticated": None,
+                    "status": "NO_COOKIES",
+                    "description": "No valid __Secure-1PSID in cookies.json for this profile.",
+                    "error": None,
+                    "httpStatus": None,
+                }
+            )
+            continue
+        try:
+            snap = await asyncio.wait_for(_run_with_client(pid, ck, do_probe), timeout=120.0)
+            rows.append(
+                {
+                    "profile": pid,
+                    "cookiesOnDisk": True,
+                    "diskHasValidPsid": True,
+                    **snap,
+                    "error": None,
+                    "httpStatus": 200,
+                }
+            )
+        except asyncio.TimeoutError:
+            rows.append(
+                {
+                    "profile": pid,
+                    "cookiesOnDisk": True,
+                    "diskHasValidPsid": True,
+                    "authenticated": None,
+                    "status": "TIMEOUT",
+                    "description": "Client init or status probe exceeded 120s.",
+                    "error": "timeout after 120s",
+                    "httpStatus": 504,
+                }
+            )
+        except Exception as e:
+            he = _http_exception_from_upstream(pid, e)
+            err_detail = he.detail
+            if not isinstance(err_detail, str):
+                err_detail = json.dumps(err_detail, ensure_ascii=False)
+            rows.append(
+                {
+                    "profile": pid,
+                    "cookiesOnDisk": True,
+                    "diskHasValidPsid": True,
+                    "authenticated": None,
+                    "status": "PROBE_ERROR",
+                    "description": None,
+                    "error": err_detail,
+                    "httpStatus": he.status_code,
+                }
+            )
+
+    return {
+        "profilesRoot": str(PROFILES_ROOT),
+        "checkedAt": checked_at,
+        "profiles": rows,
+    }
