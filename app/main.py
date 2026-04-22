@@ -693,16 +693,6 @@ def _http_exception_from_upstream(profile: str, exc: BaseException) -> HTTPExcep
     return HTTPException(status_code=502, detail=prefix + msg)
 
 
-def _raise_mapped_upstream(profile: str, exc: BaseException) -> None:
-    """Raise HTTPException from gemini_webapi; log full traceback only for mapped 5xx responses."""
-    he = _http_exception_from_upstream(profile, exc)
-    if he.status_code >= 500:
-        traceback.print_exc()
-    else:
-        log.warning("upstream profile=%s -> HTTP %s: %s", profile, he.status_code, exc)
-    raise he from exc
-
-
 def _account_status_fields_from_client(client: Any) -> dict[str, Any]:
     status_obj = getattr(client, "account_status", None)
     if status_obj is not None:
@@ -881,6 +871,33 @@ def _http_exception_detail_to_str(detail: Any) -> str:
         return json.dumps(detail, ensure_ascii=False)
     except Exception:
         return str(detail)
+
+
+async def _persist_unauthenticated_on_401(profile: str, he: HTTPException) -> None:
+    if he.status_code != 401:
+        return
+    desc = (_http_exception_detail_to_str(he.detail) or "").strip() or "Session invalid or cookies expired."
+    try:
+        await state_store.set_account_status(
+            profile,
+            {
+                "status": "UNAUTHENTICATED",
+                "description": desc,
+                "authenticated": False,
+            },
+        )
+    except Exception as e:
+        log.warning("set_account_status profile=%s (401 upstream): %s", profile, e)
+
+
+async def _raise_mapped_upstream_async(profile: str, exc: BaseException) -> None:
+    he = _http_exception_from_upstream(profile, exc)
+    await _persist_unauthenticated_on_401(profile, he)
+    if he.status_code >= 500:
+        traceback.print_exc()
+    else:
+        log.warning("upstream profile=%s -> HTTP %s: %s", profile, he.status_code, exc)
+    raise he from exc
 
 
 async def _health_monitor_loop() -> None:
@@ -1252,7 +1269,7 @@ async def list_models(
     except HTTPException:
         raise
     except Exception as e:
-        _raise_mapped_upstream(pid, e)
+        await _raise_mapped_upstream_async(pid, e)
 
 
 @app.post("/v1/generate")
@@ -1340,6 +1357,7 @@ async def generate(
             log.warning("record_generation_event profile=%s requestId=%s: %s", pid, request_id, e)
         return result
     except HTTPException as he:
+        await _persist_unauthenticated_on_401(pid, he)
         try:
             await state_store.record_generation_event(
                 {
@@ -1359,6 +1377,7 @@ async def generate(
         raise
     except Exception as e:
         he = _http_exception_from_upstream(pid, e)
+        await _persist_unauthenticated_on_401(pid, he)
         try:
             await state_store.record_generation_event(
                 {
@@ -1420,7 +1439,7 @@ async def status(
     except HTTPException:
         raise
     except Exception as e:
-        _raise_mapped_upstream(pid, e)
+        await _raise_mapped_upstream_async(pid, e)
 
 
 # --- Admin ---
@@ -1478,12 +1497,15 @@ async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Head
         updated = raw.get("updatedAt") if isinstance(raw, dict) else None
     except (json.JSONDecodeError, OSError):
         updated = None
-    cache = await state_store.get_account_status(pid)
+    cache = await state_store.get_account_status_resolved(pid)
+    last_status = cache.get("status") if cache else None
+    if last_status == state_store.SESSION_STATUS_EXPIRED:
+        last_status = "UNAUTHENTICATED"
     return {
         "profile": pid,
         "updatedAt": updated,
         "cookiesMasked": _mask_cookie_map_for_display(ck),
-        "lastAccountStatus": cache.get("status") if cache else None,
+        "lastAccountStatus": last_status,
         "lastAccountStatusCheckedAt": cache.get("checkedAt") if cache else None,
         "lastAccountStatusDescription": cache.get("description") if cache else None,
     }

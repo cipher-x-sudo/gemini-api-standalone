@@ -8,7 +8,9 @@ Profile account-status snapshots and optional Redis-backed auxiliary state.
   removed on write to avoid two sources of truth.
 
 Optional: ``GEMINI_REDIS_ACCOUNT_STATUS_TTL_SECONDS`` (>0) sets Redis EX for account
-status keys (default: no expiry).
+status keys (default: no expiry). When a key expires, ``get_account_status_resolved``
+can persist a synthetic ``SESSION_STATUS_EXPIRED`` snapshot (see that helper) so the
+admin UI does not show an empty/unknown status forever.
 
 Also: background job tick metadata (health probe loop, cookie persistence hints) and
 ``/v1/generate`` history (request id + profile + outcome), stored in Redis when
@@ -33,6 +35,10 @@ KEY_PREFIX = (os.environ.get("GEMINI_REDIS_KEY_PREFIX") or "gemini").strip().rst
 PROFILES_ROOT = Path(os.environ.get("GEMINI_PROFILES_ROOT", "/data/profiles")).resolve()
 _ACCOUNT_STATUS_DISK_NAME = "account_status.json"
 
+# Stored when Redis account_status TTL has elapsed but we know this profile had a prior
+# cached snapshot (see ``_account_status_meta_redis_key``). Admin maps this to UNAUTHENTICATED for display.
+SESSION_STATUS_EXPIRED = "SESSION_STATUS_EXPIRED"
+
 _r: Any = None
 redis_configured: bool = False
 redis_connected: bool = False
@@ -44,6 +50,20 @@ _mem_cookie_tick: dict[str, Any] = {}
 
 def _account_status_redis_key(profile_id: str) -> str:
     return f"{KEY_PREFIX}:profile:{profile_id}:account_status"
+
+
+def _account_status_meta_redis_key(profile_id: str) -> str:
+    """Set when a TTL-backed account_status snapshot was successfully written at least once."""
+    return f"{KEY_PREFIX}:profile:{profile_id}:account_status_meta"
+
+
+def account_status_ttl_seconds() -> int:
+    raw = (os.environ.get("GEMINI_REDIS_ACCOUNT_STATUS_TTL_SECONDS") or "0").strip()
+    try:
+        n = int(raw) if raw else 0
+    except ValueError:
+        n = 0
+    return max(0, n)
 
 
 def _generations_redis_key() -> str:
@@ -172,6 +192,43 @@ async def get_account_status(profile_id: str) -> Optional[dict[str, Any]]:
     return await asyncio.to_thread(_load_disk, profile_id)
 
 
+async def get_account_status_resolved(profile_id: str) -> Optional[dict[str, Any]]:
+    """
+    Return cached account status, or after Redis TTL expiry re-persist an explicit
+    unauthenticated-style row so callers can treat the profile as no longer "freshly OK".
+
+    Does nothing extra when Redis is off or account status TTL is not configured.
+    """
+    data = await get_account_status(profile_id)
+    if data is not None:
+        return data
+    ttl = account_status_ttl_seconds()
+    if not _redis_active() or ttl <= 0 or _r is None:
+        return None
+    try:
+        meta = await _r.get(_account_status_meta_redis_key(profile_id))
+    except Exception as e:
+        log.warning("Redis GET account_status_meta profile=%s: %s", profile_id, e)
+        return None
+    if not meta:
+        return None
+    stale: dict[str, Any] = {
+        "status": SESSION_STATUS_EXPIRED,
+        "description": (
+            "Cached account status expired (Redis TTL). "
+            "Use Refresh auth or POST /v1/status to re-verify this profile."
+        ),
+        "authenticated": False,
+    }
+    try:
+        await set_account_status(profile_id, stale)
+    except Exception as e:
+        log.warning("set_account_status profile=%s (rehydrate after TTL): %s", profile_id, e)
+        stale = {**stale, "checkedAt": _utc_now_iso()}
+        return stale
+    return await get_account_status(profile_id)
+
+
 async def set_account_status(profile_id: str, snapshot: dict[str, Any]) -> None:
     payload = {
         "status": snapshot.get("status"),
@@ -181,12 +238,16 @@ async def set_account_status(profile_id: str, snapshot: dict[str, Any]) -> None:
     }
     if _redis_active():
         try:
-            ttl_raw = (os.environ.get("GEMINI_REDIS_ACCOUNT_STATUS_TTL_SECONDS") or "0").strip()
-            ttl = int(ttl_raw) if ttl_raw else 0
+            ttl = account_status_ttl_seconds()
             kwargs: dict[str, Any] = {}
             if ttl > 0:
                 kwargs["ex"] = ttl
             await _r.set(_account_status_redis_key(profile_id), json.dumps(payload), **kwargs)
+            if ttl > 0 and payload.get("status") != SESSION_STATUS_EXPIRED:
+                try:
+                    await _r.set(_account_status_meta_redis_key(profile_id), "1")
+                except Exception as e:
+                    log.warning("Redis SET account_status_meta profile=%s: %s", profile_id, e)
             _unlink_disk(profile_id)
             return
         except Exception as e:
@@ -197,7 +258,7 @@ async def set_account_status(profile_id: str, snapshot: dict[str, Any]) -> None:
 async def clear_account_status(profile_id: str) -> None:
     if _redis_active():
         try:
-            await _r.delete(_account_status_redis_key(profile_id))
+            await _r.delete(_account_status_meta_redis_key(profile_id), _account_status_redis_key(profile_id))
         except Exception as e:
             log.warning("Redis DEL account_status profile=%s: %s", profile_id, e)
     await asyncio.to_thread(_unlink_disk, profile_id)
