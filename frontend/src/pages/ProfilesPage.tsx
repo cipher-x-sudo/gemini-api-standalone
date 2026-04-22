@@ -28,14 +28,27 @@ export function ProfilesPage() {
   const [selectedProfile, setSelectedProfile] = useState("");
   const [cookiesInput, setCookiesInput] = useState("");
 
-  const loadProfiles = async () => {
+  const loadProfiles = async (opts?: { probeLiveAuth?: boolean }) => {
     if (!getAdminKey()) {
       setLoading(false);
       setProfiles([]);
       return;
     }
     setLoading(true);
+    let authProbeSucceeded = false;
     try {
+      if (opts?.probeLiveAuth) {
+        try {
+          await api.getProfilesAuthStatus();
+          authProbeSucceeded = true;
+        } catch (e: any) {
+          toast({
+            title: "Auth check failed",
+            description: e?.message || "Could not refresh session status.",
+            variant: "destructive",
+          });
+        }
+      }
       const res = await api.getProfiles();
       const profileIds = res.profiles || [];
       
@@ -62,6 +75,9 @@ export function ProfilesPage() {
       setProfiles([]);
     } finally {
       setLoading(false);
+    }
+    if (opts?.probeLiveAuth && authProbeSucceeded) {
+      toast({ title: "Auth state refreshed", description: "Session status was re-checked for all profiles." });
     }
   };
 
@@ -140,9 +156,15 @@ export function ProfilesPage() {
           <p className="text-muted-foreground mt-1">Manage your Gemini API authentication profiles.</p>
         </div>
         <div className="flex gap-3">
-          <Button variant="outline" size="sm" onClick={loadProfiles} disabled={loading} className="hidden sm:flex">
-            <RefreshCw className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-            Refresh
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => loadProfiles({ probeLiveAuth: true })}
+            disabled={loading}
+            title="Re-check Gemini session for every profile (may take a while)"
+          >
+            <RefreshCw className={`mr-2 h-4 w-4 shrink-0 ${loading ? "animate-spin" : ""}`} />
+            <span className="hidden sm:inline">Refresh</span>
           </Button>
           <Dialog open={createOpen} onOpenChange={setCreateOpen}>
             <DialogTrigger asChild>
@@ -199,7 +221,14 @@ export function ProfilesPage() {
                 </TableRow>
               )}
               {profiles.map((profile) => {
-                const isAuthenticated = profile.status !== 'UNAUTHENTICATED' && profile.status !== 'UNKNOWN' && profile.status !== 'ERROR';
+                const failedAuth =
+                  profile.status === "UNAUTHENTICATED" ||
+                  profile.status === "ERROR" ||
+                  profile.status === "NO_COOKIES" ||
+                  profile.status === "TIMEOUT" ||
+                  profile.status === "PROBE_ERROR";
+                const uncertain = profile.status === "UNKNOWN";
+                const isAuthenticated = Boolean(profile.status) && !failedAuth && !uncertain;
                 return (
                 <TableRow key={profile.id} className="border-border/50 hover:bg-white/[0.04] transition-colors group">
                   <TableCell className="font-medium pl-6">{profile.id}</TableCell>

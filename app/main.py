@@ -1111,6 +1111,10 @@ async def admin_profiles_auth_status(authorization: Optional[str] = Header(None)
         disk_path = profile_root_dir(pid) / "cookies.json"
         ck = load_cookies_json_file(disk_path)
         if not ck or not ck.get("__Secure-1PSID"):
+            try:
+                await state_store.clear_account_status(pid)
+            except Exception as e:
+                log.warning("clear_account_status profile=%s (NO_COOKIES scan): %s", pid, e)
             rows.append(
                 {
                     "profile": pid,
@@ -1126,6 +1130,10 @@ async def admin_profiles_auth_status(authorization: Optional[str] = Header(None)
             continue
         try:
             snap = await asyncio.wait_for(_run_with_client(pid, ck, do_probe), timeout=120.0)
+            try:
+                await state_store.set_account_status(pid, snap)
+            except Exception as e:
+                log.warning("set_account_status profile=%s (auth-status scan): %s", pid, e)
             rows.append(
                 {
                     "profile": pid,
@@ -1137,6 +1145,17 @@ async def admin_profiles_auth_status(authorization: Optional[str] = Header(None)
                 }
             )
         except asyncio.TimeoutError:
+            try:
+                await state_store.set_account_status(
+                    pid,
+                    {
+                        "status": "TIMEOUT",
+                        "description": "Client init or status probe exceeded 120s.",
+                        "authenticated": False,
+                    },
+                )
+            except Exception as e:
+                log.warning("set_account_status profile=%s (TIMEOUT scan): %s", pid, e)
             rows.append(
                 {
                     "profile": pid,
@@ -1154,6 +1173,17 @@ async def admin_profiles_auth_status(authorization: Optional[str] = Header(None)
             err_detail = he.detail
             if not isinstance(err_detail, str):
                 err_detail = json.dumps(err_detail, ensure_ascii=False)
+            try:
+                await state_store.set_account_status(
+                    pid,
+                    {
+                        "status": "PROBE_ERROR",
+                        "description": err_detail or "",
+                        "authenticated": False,
+                    },
+                )
+            except Exception as e2:
+                log.warning("set_account_status profile=%s (PROBE_ERROR scan): %s", pid, e2)
             rows.append(
                 {
                     "profile": pid,

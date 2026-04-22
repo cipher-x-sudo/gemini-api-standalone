@@ -58,6 +58,8 @@ export const api = {
     }),
   deleteProfile: (profileId: string) => 
     fetchWithAuth(`/admin/api/profiles/${profileId}`, { method: "DELETE" }),
+  /** Live Gemini session probe for every profile (can take minutes). Persists last account status per profile. */
+  getProfilesAuthStatus: () => fetchWithAuth("/admin/api/profiles/auth-status"),
   getCookies: (profileId: string) => 
     fetchWithAuth(`/admin/api/profiles/${profileId}/cookies`),
   setCookies: (profileId: string, cookies: any) =>
