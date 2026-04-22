@@ -40,6 +40,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
+from app import state_store
+
 if sys.version_info < (3, 11) and not hasattr(enum, "StrEnum"):
 
     class StrEnum(str, enum.Enum):
@@ -329,55 +331,6 @@ def resolve_v1_profile(x_gemini_profile: Optional[str]) -> str:
     if h.lower() in _PROFILE_RANDOM_ALIASES:
         return _pick_random_profile_id()
     return _sanitize_profile_id(h)
-
-
-_ACCOUNT_STATUS_CACHE_NAME = "account_status.json"
-
-
-def _account_status_cache_path(profile_id: str) -> Path:
-    return profile_root_dir(profile_id) / _ACCOUNT_STATUS_CACHE_NAME
-
-
-def load_account_status_cache(profile_id: str) -> Optional[dict[str, Any]]:
-    path = _account_status_cache_path(profile_id)
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
-
-
-def save_account_status_cache(profile_id: str, snapshot: dict[str, Any]) -> None:
-    """Persist last successful POST /v1/status result; cleared when cookies are replaced."""
-    pid = _sanitize_profile_id(profile_id)
-    d = profile_data_dir(pid)
-    path = d / _ACCOUNT_STATUS_CACHE_NAME
-    payload = {
-        "status": snapshot.get("status"),
-        "description": snapshot.get("description") or "",
-        "authenticated": snapshot.get("authenticated"),
-        "checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-
-
-def clear_account_status_cache(profile_id: str) -> None:
-    path = _account_status_cache_path(profile_id)
-    if path.is_file():
-        try:
-            path.unlink()
-        except OSError:
-            pass
 
 
 def save_cookies_json_file(path: Path, cookie_map: dict[str, str]) -> None:
@@ -773,6 +726,7 @@ async def lifespan(app: FastAPI):
     _attach_ring_buffer_handlers()
     log.info("gemini-api log buffer ready (root + uvicorn + uvicorn.access)")
     PROFILES_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
+    await state_store.startup()
     if not ADMIN_API_KEY:
         log.warning("ADMIN_API_KEY is empty — admin routes disabled until set.")
     if GEMINI_UPSTREAM_PROXY:
@@ -785,6 +739,7 @@ async def lifespan(app: FastAPI):
             pass
     _singleton_clients.clear()
     _singleton_ids.clear()
+    await state_store.shutdown()
 
 
 app = FastAPI(title="Gemini Web API (standalone)", version="1.0.0", lifespan=lifespan)
@@ -808,6 +763,10 @@ async def health() -> dict[str, Any]:
         "autoRotate": GEMINI_AUTO_ROTATE,
         "refreshIntervalSeconds": GEMINI_REFRESH_INTERVAL_SECONDS,
         "upstreamProxyConfigured": bool(GEMINI_UPSTREAM_PROXY),
+        "redis": {
+            "configured": state_store.redis_configured,
+            "connected": state_store.redis_connected,
+        },
     }
 
 
@@ -1010,9 +969,9 @@ async def status(
                 out.get("status"),
             )
             try:
-                save_account_status_cache(pid, out)
+                await state_store.set_account_status(pid, out)
             except Exception as e:
-                log.warning("save_account_status_cache profile=%s: %s", pid, e)
+                log.warning("set_account_status profile=%s: %s", pid, e)
         return out
     except HTTPException:
         raise
@@ -1075,7 +1034,7 @@ async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Head
         updated = raw.get("updatedAt") if isinstance(raw, dict) else None
     except (json.JSONDecodeError, OSError):
         updated = None
-    cache = load_account_status_cache(pid)
+    cache = await state_store.get_account_status(pid)
     return {
         "profile": pid,
         "updatedAt": updated,
@@ -1102,6 +1061,7 @@ async def admin_delete_profile(profile_id: str, authorization: Optional[str] = H
         c = _singleton_clients.pop(pid)
         await _maybe_await_close(c)
     _singleton_ids.pop(pid, None)
+    await state_store.clear_account_status(pid)
     d = PROFILES_ROOT / pid
     if d.is_dir():
         shutil.rmtree(d, ignore_errors=True)
@@ -1116,7 +1076,7 @@ async def admin_save_cookies(profile_id: str, body: CookiesPayload, authorizatio
     if not ck:
         raise HTTPException(status_code=400, detail="Could not normalize cookies (need __Secure-1PSID).")
     save_cookies_json_file(profile_data_dir(pid) / "cookies.json", ck)
-    clear_account_status_cache(pid)
+    await state_store.clear_account_status(pid)
     # Drop cached client for this profile so next request re-inits with new cookies
     if pid in _singleton_clients:
         c = _singleton_clients.pop(pid)

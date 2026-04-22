@@ -9,6 +9,21 @@
 # For proxy.prismacreative.online → frontend:80, attach `frontend` to the same network (see README).
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: gemini-redis
+    restart: unless-stopped
+    networks:
+      - edge
+    volumes:
+      - gemini_redis:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   gemini-api:
     build: .
     image: gemini-api-standalone:local
@@ -25,9 +40,14 @@ services:
       GEMINI_V1_DEFAULT_PROFILE: ${GEMINI_V1_DEFAULT_PROFILE:-default}
       GEMINI_UPSTREAM_PROXY: ${GEMINI_UPSTREAM_PROXY:-}
       GEMINI_PROXY_SCHEME: ${GEMINI_PROXY_SCHEME:-}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      GEMINI_REDIS_KEY_PREFIX: ${GEMINI_REDIS_KEY_PREFIX:-gemini}
     volumes:
       - gemini_data:/data
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - edge
     healthcheck:
@@ -55,3 +75,4 @@ networks:
 
 volumes:
   gemini_data:
+  gemini_redis:
