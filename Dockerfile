@@ -1,4 +1,11 @@
 # Standalone HTTP wrapper for gemini_webapi (Google Gemini web app session cookies).
+FROM node:20-alpine AS frontend-builder
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend/ .
+RUN npm run build
+
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,6 +23,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY app ./app
+COPY --from=frontend-builder /frontend/dist /app/frontend/dist
 
 RUN mkdir -p /data/profiles && chmod 700 /data
 

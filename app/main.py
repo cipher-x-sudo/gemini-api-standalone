@@ -78,7 +78,7 @@ GEMINI_REFRESH_INTERVAL_SECONDS = max(60.0, _env_float("GEMINI_REFRESH_INTERVAL_
 _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
 _PROFILE_RANDOM_ALIASES = frozenset(s.lower() for s in ("random", "any", "*"))
 
-_CONTROL_PANEL_HTML = Path(__file__).resolve().parent / "control_panel.html"
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
 def _mask_cookie_value(v: str, prefix: int = 6, suffix: int = 4) -> str:
@@ -646,12 +646,17 @@ async def root_redirect() -> RedirectResponse:
     return RedirectResponse(url="/ui", status_code=302)
 
 
+if (FRONTEND_DIST / "assets").is_dir():
+    app.mount("/ui/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="ui_assets")
+
+
 @app.get("/ui", response_class=HTMLResponse)
-async def control_panel_ui() -> HTMLResponse:
-    try:
-        return HTMLResponse(_CONTROL_PANEL_HTML.read_text(encoding="utf-8"))
-    except OSError as e:
-        raise HTTPException(status_code=503, detail=f"control_panel.html not readable: {e}") from e
+@app.get("/ui/{catchall:path}", response_class=HTMLResponse)
+async def serve_spa(catchall: str = ""):
+    index = FRONTEND_DIST / "index.html"
+    if not index.is_file():
+        raise HTTPException(status_code=503, detail="Frontend index.html not found. Please build the frontend.")
+    return HTMLResponse(index.read_text(encoding="utf-8"))
 
 
 @app.get("/admin", include_in_schema=False)
