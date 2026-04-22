@@ -6,7 +6,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { getAdminKey, setAdminKey } from "@/lib/api";
+import { getAdminKey, setAdminKey, getClientKey, setClientKey } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 
 const navItems = [
@@ -19,10 +19,12 @@ export function Sidebar() {
   const { toast } = useToast();
   const [open, setOpen] = useState(false);
   const [apiKey, setApiKey] = useState(getAdminKey());
+  const [clientKey, setClientKeyLocal] = useState(getClientKey());
 
   const handleSave = () => {
     setAdminKey(apiKey);
-    toast({ title: "Settings Saved", description: "Admin API Key has been updated." });
+    setClientKey(clientKey);
+    toast({ title: "Settings Saved", description: "API Keys have been updated." });
     setOpen(false);
     window.dispatchEvent(new Event("apiKeyUpdated"));
   };
@@ -71,7 +73,7 @@ export function Sidebar() {
             </DialogHeader>
             <div className="grid gap-4 py-4">
               <div className="grid grid-cols-4 items-center gap-4">
-                <Label htmlFor="apiKey" className="text-right">
+                <Label htmlFor="apiKey" className="text-right text-xs">
                   Admin API Key
                 </Label>
                 <Input
@@ -81,6 +83,19 @@ export function Sidebar() {
                   onChange={(e) => setApiKey(e.target.value)}
                   className="col-span-3"
                   placeholder="Paste your key here..."
+                />
+              </div>
+              <div className="grid grid-cols-4 items-center gap-4">
+                <Label htmlFor="clientKey" className="text-right text-xs">
+                  Client API Key
+                </Label>
+                <Input
+                  id="clientKey"
+                  type="password"
+                  value={clientKey}
+                  onChange={(e) => setClientKeyLocal(e.target.value)}
+                  className="col-span-3"
+                  placeholder="Optional client key..."
                 />
               </div>
             </div>

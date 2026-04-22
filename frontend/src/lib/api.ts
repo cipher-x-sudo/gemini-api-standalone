@@ -8,6 +8,14 @@ export function setAdminKey(key: string) {
   localStorage.setItem("ADMIN_API_KEY", key);
 }
 
+export function getClientKey() {
+  return localStorage.getItem("GEMINI_API_CLIENT_KEY") || "";
+}
+
+export function setClientKey(key: string) {
+  localStorage.setItem("GEMINI_API_CLIENT_KEY", key);
+}
+
 async function fetchWithAuth(url: string, options: RequestInit = {}) {
   const key = getAdminKey();
   const headers = new Headers(options.headers || {});
@@ -46,14 +54,18 @@ export const api = {
       body: JSON.stringify({ cookies })
     }),
   checkStatus: async (profileId: string) => {
-    // Note: /v1/status doesn't use ADMIN_API_KEY, it uses X-Gemini-Profile header
-    // and optionally X-Gemini-Api-Key which we might not have in the UI.
+    const headers: Record<string, string> = { 
+      "Content-Type": "application/json",
+      "X-Gemini-Profile": profileId
+    };
+    const clientKey = getClientKey();
+    if (clientKey) {
+      headers["X-Gemini-Api-Key"] = clientKey;
+    }
+
     const response = await fetch(`${API_BASE}/v1/status`, {
       method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "X-Gemini-Profile": profileId
-      },
+      headers,
       body: JSON.stringify({})
     });
     if (!response.ok) {
