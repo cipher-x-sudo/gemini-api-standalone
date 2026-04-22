@@ -1,5 +1,6 @@
-/** Same origin as the UI when served from FastAPI (/ui). Override at build time if the API is on another origin. */
-const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, "") ?? "";
+/** Unset, empty, or whitespace = same origin as the page. Set only when the API is on another origin (build-time). */
+const _apiBaseRaw = (import.meta.env.VITE_API_BASE as string | undefined)?.trim() ?? "";
+const API_BASE = _apiBaseRaw === "" ? "" : _apiBaseRaw.replace(/\/$/, "");
 
 export function getAdminKey() {
   return localStorage.getItem("ADMIN_API_KEY") || "";
