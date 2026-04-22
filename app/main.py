@@ -67,8 +67,21 @@ def _log_record_to_item(record: logging.LogRecord) -> dict[str, Any]:
     }
 
 
+def _skip_ring_buffer_record(record: logging.LogRecord) -> bool:
+    """Avoid flooding the UI log buffer with the logs endpoint's own access lines."""
+    if record.name != "uvicorn.access":
+        return False
+    try:
+        msg = record.getMessage()
+    except Exception:
+        return False
+    return "/admin/api/logs" in msg
+
+
 class _RingBufferHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
+        if _skip_ring_buffer_record(record):
+            return
         try:
             item = _log_record_to_item(record)
         except Exception:
@@ -782,7 +795,11 @@ async def list_models(
         return {"models": out, "profile": pid}
 
     try:
-        return await _run_with_client(pid, ck, do_list)
+        log.info("POST /v1/list-models profile=%s", pid)
+        out = await _run_with_client(pid, ck, do_list)
+        n = len(out.get("models") or []) if isinstance(out, dict) else 0
+        log.info("POST /v1/list-models profile=%s ok models=%s", pid, n)
+        return out
     except HTTPException:
         raise
     except Exception as e:
@@ -840,7 +857,20 @@ async def generate(
         return {"text": text or "", "profile": pid}
 
     try:
-        return await _run_with_client(pid, ck, do_gen)
+        n_img = len(body.images or [])
+        want_json = body.responseMimeType == "application/json"
+        log.info(
+            "POST /v1/generate profile=%s model=%s images=%s prompt_chars=%s json=%s",
+            pid,
+            (body.model or "").strip() or "default",
+            n_img,
+            len(body.prompt or ""),
+            want_json,
+        )
+        result = await _run_with_client(pid, ck, do_gen)
+        rchars = len((result.get("text") or "")) if isinstance(result, dict) else 0
+        log.info("POST /v1/generate profile=%s completed response_chars=%s", pid, rchars)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -868,7 +898,16 @@ async def status(
         return {**d, "profile": pid}
 
     try:
-        return await _run_with_client(pid, ck, do_status)
+        log.info("POST /v1/status profile=%s", pid)
+        out = await _run_with_client(pid, ck, do_status)
+        if isinstance(out, dict):
+            log.info(
+                "POST /v1/status profile=%s ok authenticated=%s account_status=%s",
+                pid,
+                out.get("authenticated"),
+                out.get("status"),
+            )
+        return out
     except HTTPException:
         raise
     except Exception as e:
