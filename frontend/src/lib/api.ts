@@ -37,7 +37,18 @@ async function fetchWithAuth(url: string, options: RequestInit = {}) {
   return response.json();
 }
 
+export type LogLine = { t: string; level: string; logger: string; msg: string };
+
+export type LogsResponse = {
+  lines: LogLine[];
+  bufferMax: number;
+  returned: number;
+  totalInBuffer: number;
+};
+
 export const api = {
+  getLogs: (limit = 800) =>
+    fetchWithAuth(`/admin/api/logs?limit=${encodeURIComponent(String(limit))}`) as Promise<LogsResponse>,
   getProfiles: () => fetchWithAuth("/admin/api/profiles"),
   createProfile: (profileId: string) => 
     fetchWithAuth("/admin/api/profiles", {

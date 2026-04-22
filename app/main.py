@@ -24,7 +24,9 @@ import secrets
 import sys
 import shutil
 import tempfile
+import threading
 import traceback
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +47,39 @@ if sys.version_info < (3, 11) and not hasattr(enum, "StrEnum"):
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gemini-api-standalone")
+
+_LOG_BUFFER_MAX = max(100, int(os.environ.get("GEMINI_LOG_BUFFER_LINES", "3000")))
+_log_lock = threading.Lock()
+_log_buffer: deque[dict[str, Any]] = deque(maxlen=_LOG_BUFFER_MAX)
+
+
+def _log_record_to_item(record: logging.LogRecord) -> dict[str, Any]:
+    try:
+        msg = record.getMessage()
+    except Exception:
+        msg = "<unprintable log message>"
+    ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return {
+        "t": ts,
+        "level": record.levelname,
+        "logger": record.name,
+        "msg": msg,
+    }
+
+
+class _RingBufferHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            item = _log_record_to_item(record)
+        except Exception:
+            return
+        with _log_lock:
+            _log_buffer.append(item)
+
+
+_root_ring = _RingBufferHandler()
+_root_ring.setLevel(logging.DEBUG)
+logging.getLogger().addHandler(_root_ring)
 
 PROFILES_ROOT = Path(os.environ.get("GEMINI_PROFILES_ROOT", "/data/profiles")).resolve()
 ADMIN_API_KEY = (os.environ.get("ADMIN_API_KEY") or "").strip()
@@ -681,6 +716,22 @@ async def admin_server_info(authorization: Optional[str] = Header(None)) -> dict
         "adminConfigured": bool(ADMIN_API_KEY),
         "autoRotate": GEMINI_AUTO_ROTATE,
         "refreshIntervalSeconds": GEMINI_REFRESH_INTERVAL_SECONDS,
+    }
+
+
+@app.get("/admin/api/logs")
+async def admin_logs(authorization: Optional[str] = Header(None), limit: int = 500) -> dict[str, Any]:
+    """Recent application + uvicorn log lines (ring buffer, admin only)."""
+    _check_admin(authorization)
+    lim = max(1, min(int(limit), 2000))
+    with _log_lock:
+        snap = list(_log_buffer)
+    lines = snap[-lim:] if len(snap) > lim else snap
+    return {
+        "lines": lines,
+        "bufferMax": _LOG_BUFFER_MAX,
+        "returned": len(lines),
+        "totalInBuffer": len(snap),
     }
 
 
