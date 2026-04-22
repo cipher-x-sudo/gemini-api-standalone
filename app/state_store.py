@@ -9,6 +9,10 @@ Profile account-status snapshots and optional Redis-backed auxiliary state.
 
 Optional: ``GEMINI_REDIS_ACCOUNT_STATUS_TTL_SECONDS`` (>0) sets Redis EX for account
 status keys (default: no expiry).
+
+Also: background job tick metadata (health probe loop, cookie persistence hints) and
+``/v1/generate`` history (request id + profile + outcome), stored in Redis when
+available, else small JSONL under ``GEMINI_PROFILES_ROOT`` (``_generation_history.jsonl``).
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,9 +36,38 @@ _r: Any = None
 redis_configured: bool = False
 redis_connected: bool = False
 
+# In-memory job ticks when Redis is unavailable (single-process).
+_mem_health_tick: dict[str, Any] = {}
+_mem_cookie_tick: dict[str, Any] = {}
+
 
 def _account_status_redis_key(profile_id: str) -> str:
     return f"{KEY_PREFIX}:profile:{profile_id}:account_status"
+
+
+def _generations_redis_key() -> str:
+    return f"{KEY_PREFIX}:generations"
+
+
+def _job_health_redis_key() -> str:
+    return f"{KEY_PREFIX}:job:health"
+
+
+def _job_cookie_redis_key() -> str:
+    return f"{KEY_PREFIX}:job:cookie_rotation"
+
+
+def _generations_max() -> int:
+    raw = (os.environ.get("GEMINI_REDIS_GENERATIONS_MAX") or "500").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 500
+    return max(10, min(n, 50_000))
+
+
+def _generations_disk_path() -> Path:
+    return PROFILES_ROOT / "_generation_history.jsonl"
 
 
 def _disk_path(profile_id: str) -> Path:
@@ -201,3 +234,163 @@ async def kv_delete(scope: str, name: str) -> None:
         await _r.delete(key)
     except Exception as e:
         log.warning("Redis DEL kv scope=%s name=%s: %s", scope, name, e)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_plus_seconds(iso_base: str, seconds: float) -> str:
+    try:
+        base = datetime.strptime(iso_base, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        base = datetime.now(timezone.utc)
+    return (base + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def record_health_job_tick(*, ok: bool, detail: str, interval_seconds: float) -> None:
+    """Persist last/next health probe times for the admin Jobs UI."""
+    global _mem_health_tick
+    now = _utc_now_iso()
+    nxt = _iso_plus_seconds(now, interval_seconds)
+    payload = {
+        "lastRunAt": now,
+        "nextRunAt": nxt,
+        "ok": bool(ok),
+        "detail": (detail or "")[:2000],
+    }
+    if _redis_active():
+        try:
+            await _r.set(_job_health_redis_key(), json.dumps(payload))
+            return
+        except Exception as e:
+            log.warning("Redis SET health job tick: %s", e)
+    _mem_health_tick = dict(payload)
+
+
+async def record_cookie_persist_hint(*, profile_id: str) -> None:
+    """
+    Best-effort timestamp when session cookies were persisted (generate/status/etc.).
+    Used by the Jobs UI as activity signal alongside GEMINI_REFRESH_INTERVAL_SECONDS.
+    """
+    global _mem_cookie_tick
+    now = _utc_now_iso()
+    payload = {
+        "lastPersistAt": now,
+        "lastProfile": (profile_id or "")[:128],
+    }
+    if _redis_active():
+        try:
+            await _r.set(_job_cookie_redis_key(), json.dumps(payload))
+            return
+        except Exception as e:
+            log.warning("Redis SET cookie job hint: %s", e)
+    _mem_cookie_tick = dict(payload)
+
+
+async def redis_ping_ok() -> tuple[bool, str]:
+    """Returns (ok, detail) for an optional connectivity probe (admin health job)."""
+    if not redis_configured:
+        return True, "redis not configured"
+    if not _redis_active():
+        return False, "redis configured but not connected"
+    try:
+        await asyncio.wait_for(_r.ping(), timeout=3.0)
+        return True, "redis ping ok"
+    except Exception as e:
+        return False, f"redis ping failed: {e}"
+
+
+async def get_job_ticks() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Returns (health_tick, cookie_tick) dicts possibly empty."""
+    health: dict[str, Any] = {}
+    cookie: dict[str, Any] = {}
+    if _redis_active():
+        try:
+            raw_h = await _r.get(_job_health_redis_key())
+            if raw_h:
+                h = json.loads(raw_h)
+                if isinstance(h, dict):
+                    health = h
+        except Exception as e:
+            log.warning("Redis GET health job tick: %s", e)
+        try:
+            raw_c = await _r.get(_job_cookie_redis_key())
+            if raw_c:
+                c = json.loads(raw_c)
+                if isinstance(c, dict):
+                    cookie = c
+        except Exception as e:
+            log.warning("Redis GET cookie job tick: %s", e)
+    if not health and _mem_health_tick:
+        health = dict(_mem_health_tick)
+    if not cookie and _mem_cookie_tick:
+        cookie = dict(_mem_cookie_tick)
+    return health, cookie
+
+
+def _append_generation_disk_line(line: str) -> None:
+    path = _generations_disk_path()
+    try:
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        log.warning("generation history disk append failed: %s", e)
+
+
+async def record_generation_event(event: dict[str, Any]) -> None:
+    """
+    Record a /v1/generate outcome (success or mapped HTTP error). Payload should be JSON-serializable.
+    """
+    row = dict(event)
+    row.setdefault("recordedAt", _utc_now_iso())
+    line = json.dumps(row, ensure_ascii=False)
+    if _redis_active():
+        try:
+            key = _generations_redis_key()
+            max_n = _generations_max()
+            await _r.lpush(key, line)
+            await _r.ltrim(key, 0, max_n - 1)
+            return
+        except Exception as e:
+            log.warning("Redis LPUSH generations: %s — falling back to disk", e)
+    _append_generation_disk_line(line)
+
+
+async def list_generation_events(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 500))
+    off = max(0, int(offset))
+    out: list[dict[str, Any]] = []
+    if _redis_active():
+        try:
+            raw_rows = await _r.lrange(_generations_redis_key(), off, off + lim - 1)
+            for raw in raw_rows or []:
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict):
+                    out.append(data)
+            return out
+        except Exception as e:
+            log.warning("Redis LRANGE generations: %s — falling back to disk", e)
+    path = _generations_disk_path()
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    chunk: list[dict[str, Any]] = []
+    for ln in reversed(lines):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            data = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            chunk.append(data)
+    return chunk[off : off + lim]

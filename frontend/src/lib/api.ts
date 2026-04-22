@@ -46,6 +46,48 @@ export type LogsResponse = {
   totalInBuffer: number;
 };
 
+export type AdminJobRow = {
+  id: string;
+  type: string;
+  status: string;
+  lastRunAt?: string | null;
+  nextRunAt?: string | null;
+  lastProfile?: string | null;
+  detail?: string | null;
+  ok?: boolean | null;
+};
+
+export type AdminJobsResponse = {
+  serverTime: string;
+  autoRotate: boolean;
+  refreshIntervalSeconds: number;
+  healthCheckIntervalSeconds: number;
+  redis: { configured: boolean; connected: boolean };
+  jobs: AdminJobRow[];
+};
+
+export type GenerationEvent = {
+  requestId?: string;
+  profile?: string;
+  ok?: boolean;
+  httpStatus?: number;
+  error?: string;
+  model?: string | null;
+  promptChars?: number;
+  imageCount?: number;
+  responseChars?: number;
+  endpoint?: string;
+  recordedAt?: string;
+};
+
+export type AdminGenerationsResponse = {
+  limit: number;
+  offset: number;
+  returned: number;
+  generations: GenerationEvent[];
+  redis: { configured: boolean; connected: boolean };
+};
+
 export const api = {
   getLogs: (limit = 800) =>
     fetchWithAuth(`/admin/api/logs?limit=${encodeURIComponent(String(limit))}`) as Promise<LogsResponse>,
@@ -68,6 +110,11 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cookies })
     }),
+  getJobs: () => fetchWithAuth("/admin/api/jobs") as Promise<AdminJobsResponse>,
+  getGenerations: (limit = 50, offset = 0) =>
+    fetchWithAuth(
+      `/admin/api/generations?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`,
+    ) as Promise<AdminGenerationsResponse>,
   checkStatus: async (profileId: string) => {
     const headers: Record<string, string> = { 
       "Content-Type": "application/json",

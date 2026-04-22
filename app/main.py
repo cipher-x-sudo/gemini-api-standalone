@@ -27,9 +27,10 @@ import shutil
 import tempfile
 import threading
 import traceback
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote
@@ -186,6 +187,7 @@ GEMINI_AUTO_ROTATE = _env_bool(
     _env_bool("GEMINI_AUTO_REFRESH", True),
 )
 GEMINI_REFRESH_INTERVAL_SECONDS = max(60.0, _env_float("GEMINI_REFRESH_INTERVAL_SECONDS", 600.0))
+HEALTH_CHECK_INTERVAL_SECONDS = max(15.0, _env_float("GEMINI_HEALTH_CHECK_INTERVAL_SECONDS", 60.0))
 
 _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
 _PROFILE_RANDOM_ALIASES = frozenset(s.lower() for s in ("random", "any", "*"))
@@ -654,6 +656,44 @@ def _normalize_model_for_gemini_web(requested: str) -> str | None:
 _singleton_clients: dict[str, Any] = {}
 _singleton_locks: dict[str, asyncio.Lock] = {}
 _singleton_ids: dict[str, str] = {}
+_health_monitor_task: Optional[asyncio.Task] = None
+
+
+def _http_exception_detail_to_str(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail
+    try:
+        return json.dumps(detail, ensure_ascii=False)
+    except Exception:
+        return str(detail)
+
+
+async def _health_monitor_loop() -> None:
+    """Persist periodic health probes for the admin Jobs UI."""
+    while True:
+        try:
+            ok, detail = await state_store.redis_ping_ok()
+            await state_store.record_health_job_tick(
+                ok=ok,
+                detail=detail,
+                interval_seconds=HEALTH_CHECK_INTERVAL_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("health monitor tick: %s", e)
+            try:
+                await state_store.record_health_job_tick(
+                    ok=False,
+                    detail=str(e),
+                    interval_seconds=HEALTH_CHECK_INTERVAL_SECONDS,
+                )
+            except Exception:
+                pass
+        try:
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
 
 
 def _cookie_identity_hash(ck: dict[str, str]) -> str:
@@ -719,10 +759,15 @@ async def _run_with_client(
         norm = normalize_gemini_web_cookies_from_parsed(flat)
         if norm:
             save_cookies_json_file(profile_data_dir(profile_id) / "cookies.json", norm)
+            try:
+                await state_store.record_cookie_persist_hint(profile_id=profile_id)
+            except Exception:
+                pass
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _health_monitor_task
     _attach_ring_buffer_handlers()
     log.info("gemini-api log buffer ready (root + uvicorn + uvicorn.access)")
     PROFILES_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -731,7 +776,15 @@ async def lifespan(app: FastAPI):
         log.warning("ADMIN_API_KEY is empty — admin routes disabled until set.")
     if GEMINI_UPSTREAM_PROXY:
         log.info("GEMINI_UPSTREAM_PROXY is set — GeminiClient will use that proxy for upstream requests.")
+    _health_monitor_task = asyncio.create_task(_health_monitor_loop())
     yield
+    if _health_monitor_task is not None:
+        _health_monitor_task.cancel()
+        try:
+            await _health_monitor_task
+        except asyncio.CancelledError:
+            pass
+        _health_monitor_task = None
     for pid, c in list(_singleton_clients.items()):
         try:
             await _maybe_await_close(c)
@@ -830,6 +883,93 @@ async def admin_logs(authorization: Optional[str] = Header(None), limit: int = 5
     }
 
 
+def _estimate_next_iso_from_last(last_iso: Optional[str], delta_sec: float) -> Optional[str]:
+    if not last_iso or not str(last_iso).strip():
+        return None
+    try:
+        t = datetime.strptime(str(last_iso).strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return (t + timedelta(seconds=delta_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+@app.get("/admin/api/jobs")
+async def admin_jobs(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """
+    Background job snapshot for the admin UI (cookie auto-refresh + periodic health probe).
+    Persisted fields use Redis when connected; otherwise in-memory ticks on this process.
+    """
+    _check_admin(authorization)
+    health_t, cookie_t = await state_store.get_job_ticks()
+    last_persist = cookie_t.get("lastPersistAt") if isinstance(cookie_t.get("lastPersistAt"), str) else None
+    next_cookie_est = None
+    if GEMINI_AUTO_ROTATE and last_persist:
+        next_cookie_est = _estimate_next_iso_from_last(last_persist, GEMINI_REFRESH_INTERVAL_SECONDS)
+    health_ok = bool(health_t.get("ok")) if isinstance(health_t, dict) and "ok" in health_t else True
+    if not health_t:
+        health_status = "Idle"
+    elif "ok" not in health_t:
+        health_status = "Idle"
+    elif not health_ok:
+        health_status = "Failed"
+    else:
+        health_status = "Running"
+    rotate_status = "Running" if GEMINI_AUTO_ROTATE else "Stopped"
+    return {
+        "serverTime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "autoRotate": GEMINI_AUTO_ROTATE,
+        "refreshIntervalSeconds": int(GEMINI_REFRESH_INTERVAL_SECONDS),
+        "healthCheckIntervalSeconds": int(HEALTH_CHECK_INTERVAL_SECONDS),
+        "redis": {
+            "configured": state_store.redis_configured,
+            "connected": state_store.redis_connected,
+        },
+        "jobs": [
+            {
+                "id": "job-rotate-1psidts",
+                "type": "Cookie Rotation",
+                "status": rotate_status,
+                "lastRunAt": last_persist,
+                "lastProfile": cookie_t.get("lastProfile"),
+                "nextRunAt": next_cookie_est,
+                "detail": "Session cookies are persisted after upstream calls; gemini_webapi refreshes __Secure-1PSIDTS on a timer when autoRotate is enabled.",
+            },
+            {
+                "id": "job-health-check",
+                "type": "Health Check",
+                "status": health_status,
+                "lastRunAt": health_t.get("lastRunAt"),
+                "nextRunAt": health_t.get("nextRunAt"),
+                "detail": health_t.get("detail"),
+                "ok": health_ok if health_t else None,
+            },
+        ],
+    }
+
+
+@app.get("/admin/api/generations")
+async def admin_generations(
+    authorization: Optional[str] = Header(None),
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Recent /v1/generate outcomes (request id, profile, success/failure) from Redis or disk."""
+    _check_admin(authorization)
+    lim = max(1, min(int(limit), 200))
+    off = max(0, int(offset))
+    rows = await state_store.list_generation_events(limit=lim, offset=off)
+    return {
+        "limit": lim,
+        "offset": off,
+        "returned": len(rows),
+        "generations": rows,
+        "redis": {
+            "configured": state_store.redis_configured,
+            "connected": state_store.redis_connected,
+        },
+    }
+
+
 @app.post("/v1/list-models")
 async def list_models(
     body: CookiesBody,
@@ -873,9 +1013,13 @@ async def generate(
     x_gemini_profile: Optional[str] = Header(None, alias="X-Gemini-Profile"),
     x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
 ) -> dict[str, Any]:
+    request_id = str(uuid.uuid4())
     _check_optional_client_key(x_gemini_api_key)
     pid = resolve_v1_profile(x_gemini_profile)
     ck = resolve_cookies_for_request(pid, body.cookies)
+    model_requested = (body.model or "").strip() or None
+    prompt_len = len(body.prompt or "")
+    n_img = len(body.images or [])
 
     prompt = body.prompt or ""
     if body.responseMimeType == "application/json":
@@ -915,27 +1059,80 @@ async def generate(
         text = getattr(out, "text", None)
         if text is None:
             text = str(out)
-        return {"text": text or "", "profile": pid}
+        return {"text": text or "", "profile": pid, "requestId": request_id}
 
     try:
-        n_img = len(body.images or [])
         want_json = body.responseMimeType == "application/json"
         log.info(
-            "POST /v1/generate profile=%s model=%s images=%s prompt_chars=%s json=%s",
+            "POST /v1/generate profile=%s model=%s images=%s prompt_chars=%s json=%s requestId=%s",
             pid,
             (body.model or "").strip() or "default",
             n_img,
             len(body.prompt or ""),
             want_json,
+            request_id,
         )
         result = await _run_with_client(pid, ck, do_gen)
         rchars = len((result.get("text") or "")) if isinstance(result, dict) else 0
-        log.info("POST /v1/generate profile=%s completed response_chars=%s", pid, rchars)
+        log.info("POST /v1/generate profile=%s completed response_chars=%s requestId=%s", pid, rchars, request_id)
+        try:
+            await state_store.record_generation_event(
+                {
+                    "requestId": request_id,
+                    "profile": pid,
+                    "ok": True,
+                    "httpStatus": 200,
+                    "model": model_requested,
+                    "promptChars": prompt_len,
+                    "imageCount": n_img,
+                    "responseChars": rchars,
+                    "endpoint": "/v1/generate",
+                }
+            )
+        except Exception as e:
+            log.warning("record_generation_event profile=%s requestId=%s: %s", pid, request_id, e)
         return result
-    except HTTPException:
+    except HTTPException as he:
+        try:
+            await state_store.record_generation_event(
+                {
+                    "requestId": request_id,
+                    "profile": pid,
+                    "ok": False,
+                    "httpStatus": int(he.status_code),
+                    "error": _http_exception_detail_to_str(he.detail),
+                    "model": model_requested,
+                    "promptChars": prompt_len,
+                    "imageCount": n_img,
+                    "endpoint": "/v1/generate",
+                }
+            )
+        except Exception as e:
+            log.warning("record_generation_event profile=%s requestId=%s: %s", pid, request_id, e)
         raise
     except Exception as e:
-        _raise_mapped_upstream(pid, e)
+        he = _http_exception_from_upstream(pid, e)
+        try:
+            await state_store.record_generation_event(
+                {
+                    "requestId": request_id,
+                    "profile": pid,
+                    "ok": False,
+                    "httpStatus": int(he.status_code),
+                    "error": _http_exception_detail_to_str(he.detail),
+                    "model": model_requested,
+                    "promptChars": prompt_len,
+                    "imageCount": n_img,
+                    "endpoint": "/v1/generate",
+                }
+            )
+        except Exception as e2:
+            log.warning("record_generation_event profile=%s requestId=%s: %s", pid, request_id, e2)
+        if he.status_code >= 500:
+            traceback.print_exc()
+        else:
+            log.warning("upstream profile=%s -> HTTP %s: %s", pid, he.status_code, e)
+        raise he from e
     finally:
         for p in temp_paths:
             try:
