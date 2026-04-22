@@ -653,6 +653,53 @@ def _normalize_model_for_gemini_web(requested: str) -> str | None:
     return m0
 
 
+def _builtin_gemini_web_model_names() -> list[str]:
+    from gemini_webapi.constants import Model
+
+    return [m.model_name for m in Model if m is not Model.UNSPECIFIED]
+
+
+async def _list_model_ids_from_client(client: Any) -> list[str]:
+    lm = getattr(client, "list_models", None)
+    if not callable(lm):
+        return []
+    raw = lm()
+    if asyncio.iscoroutine(raw):
+        raw = await raw
+    ids: list[str] = []
+    if not raw:
+        return ids
+    for m in raw:
+        mid = getattr(m, "model_name", None) or getattr(m, "name", None) or str(m)
+        ids.append(str(mid))
+    return ids
+
+
+async def _pick_random_model_name_for_generate(client: Any) -> str:
+    """
+    When the request omits model (or sends 'unspecified'): pick uniformly from
+    client.list_models() when possible, else from gemini_webapi Model enum names.
+    """
+    raw_ids = await _list_model_ids_from_client(client)
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for x in raw_ids:
+        s = (x or "").strip()
+        if not s or s.lower() == "unspecified" or s in seen:
+            continue
+        seen.add(s)
+        candidates.append(s)
+    if candidates:
+        choice = secrets.choice(candidates)
+        resolved = _normalize_model_for_gemini_web(choice)
+        if resolved:
+            return resolved
+    builtins = _builtin_gemini_web_model_names()
+    if not builtins:
+        raise HTTPException(status_code=501, detail="No models available to choose from")
+    return secrets.choice(builtins)
+
+
 _singleton_clients: dict[str, Any] = {}
 _singleton_locks: dict[str, asyncio.Lock] = {}
 _singleton_ids: dict[str, str] = {}
@@ -1052,6 +1099,8 @@ async def generate(
             resolved = _normalize_model_for_gemini_web(str(m).strip())
             if resolved:
                 kwargs["model"] = resolved
+        else:
+            kwargs["model"] = await _pick_random_model_name_for_generate(client)
         if temp_paths:
             out = await client.generate_content(prompt, files=temp_paths, **kwargs)
         else:
@@ -1059,14 +1108,17 @@ async def generate(
         text = getattr(out, "text", None)
         if text is None:
             text = str(out)
-        return {"text": text or "", "profile": pid, "requestId": request_id}
+        out_body: dict[str, Any] = {"text": text or "", "profile": pid, "requestId": request_id}
+        if kwargs.get("model"):
+            out_body["model"] = kwargs["model"]
+        return out_body
 
     try:
         want_json = body.responseMimeType == "application/json"
         log.info(
             "POST /v1/generate profile=%s model=%s images=%s prompt_chars=%s json=%s requestId=%s",
             pid,
-            (body.model or "").strip() or "default",
+            (body.model or "").strip() or "random",
             n_img,
             len(body.prompt or ""),
             want_json,
@@ -1074,7 +1126,14 @@ async def generate(
         )
         result = await _run_with_client(pid, ck, do_gen)
         rchars = len((result.get("text") or "")) if isinstance(result, dict) else 0
-        log.info("POST /v1/generate profile=%s completed response_chars=%s requestId=%s", pid, rchars, request_id)
+        effective_model = result.get("model") if isinstance(result, dict) else None
+        log.info(
+            "POST /v1/generate profile=%s completed response_chars=%s model=%s requestId=%s",
+            pid,
+            rchars,
+            effective_model or model_requested or "",
+            request_id,
+        )
         try:
             await state_store.record_generation_event(
                 {
@@ -1082,7 +1141,7 @@ async def generate(
                     "profile": pid,
                     "ok": True,
                     "httpStatus": 200,
-                    "model": model_requested,
+                    "model": effective_model or model_requested,
                     "promptChars": prompt_len,
                     "imageCount": n_img,
                     "responseChars": rchars,
