@@ -30,4 +30,5 @@ RUN mkdir -p /data/profiles && chmod 700 /data
 # Container listen port (override with -e GEMINI_INTERNAL_PORT=...). Not 8080 by default.
 EXPOSE 9380
 
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${GEMINI_INTERNAL_PORT:-9380}"]
+# Set GEMINI_UVICORN_WORKERS>1 for multiple processes (each has its own in-memory Gemini client cache).
+CMD ["sh", "-c", "W=${GEMINI_UVICORN_WORKERS:-1}; if [ \"$W\" -gt 1 ]; then exec uvicorn app.main:app --host 0.0.0.0 --port ${GEMINI_INTERNAL_PORT:-9380} --workers \"$W\"; else exec uvicorn app.main:app --host 0.0.0.0 --port ${GEMINI_INTERNAL_PORT:-9380}; fi"]

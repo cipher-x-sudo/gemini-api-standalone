@@ -20,6 +20,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import secrets
 import sys
@@ -29,10 +30,12 @@ import threading
 import traceback
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Header
@@ -179,6 +182,96 @@ def _env_float(name: str, default: float) -> float:
         return float(str(raw).strip())
     except ValueError:
         return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
+T = TypeVar("T")
+
+_sync_io_executor: Optional[ThreadPoolExecutor] = None
+_UPSTREAM_GLOBAL_LIMIT = _env_int("GEMINI_MAX_CONCURRENT_UPSTREAM_GLOBAL", 0)
+_UPSTREAM_PER_PROFILE_LIMIT = _env_int("GEMINI_MAX_CONCURRENT_UPSTREAM_PER_PROFILE", 0)
+_upstream_global_sem: Optional[asyncio.Semaphore] = None
+_upstream_profile_sems: dict[str, asyncio.Semaphore] = {}
+_upstream_sem_init_lock = asyncio.Lock()
+
+
+async def _run_sync_io(func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+    """Run blocking sync work off the event loop (dedicated pool if GEMINI_SYNC_IO_THREADS > 0)."""
+    loop = asyncio.get_running_loop()
+    ex = _sync_io_executor
+    if kwargs:
+        bound: Callable[[], T] = partial(func, *args, **kwargs)  # type: ignore[assignment]
+        if ex is not None:
+            return await loop.run_in_executor(ex, bound)
+        return await asyncio.to_thread(bound)
+    if ex is not None:
+        return await loop.run_in_executor(ex, func, *args)
+    return await asyncio.to_thread(func, *args)
+
+
+async def _ensure_upstream_global_sem() -> Optional[asyncio.Semaphore]:
+    global _upstream_global_sem
+    if _UPSTREAM_GLOBAL_LIMIT <= 0:
+        return None
+    async with _upstream_sem_init_lock:
+        if _upstream_global_sem is None:
+            _upstream_global_sem = asyncio.Semaphore(_UPSTREAM_GLOBAL_LIMIT)
+        return _upstream_global_sem
+
+
+async def _ensure_profile_upstream_sem(profile_id: str) -> Optional[asyncio.Semaphore]:
+    if _UPSTREAM_PER_PROFILE_LIMIT <= 0:
+        return None
+    pid = _sanitize_profile_id(profile_id)
+    async with _upstream_sem_init_lock:
+        sem = _upstream_profile_sems.get(pid)
+        if sem is None:
+            sem = asyncio.Semaphore(_UPSTREAM_PER_PROFILE_LIMIT)
+            _upstream_profile_sems[pid] = sem
+        return sem
+
+
+@asynccontextmanager
+async def _upstream_concurrency_gate(profile_id: str):
+    """Limit concurrent Gemini upstream calls (global then per-profile acquire order)."""
+    sem_g = await _ensure_upstream_global_sem()
+    sem_p = await _ensure_profile_upstream_sem(profile_id)
+    if sem_g:
+        await sem_g.acquire()
+    try:
+        if sem_p:
+            await sem_p.acquire()
+        try:
+            yield
+        finally:
+            if sem_p:
+                sem_p.release()
+    finally:
+        if sem_g:
+            sem_g.release()
+
+
+def _is_upstream_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, HTTPException):
+        return int(exc.status_code) == 429
+    try:
+        from gemini_webapi.exceptions import APIError, TemporarilyBlocked, UsageLimitExceeded
+    except ImportError:
+        return False
+    if isinstance(exc, (UsageLimitExceeded, TemporarilyBlocked)):
+        return True
+    if isinstance(exc, APIError):
+        return _parse_http_status_from_gemini_message(str(exc)) == 429
+    return False
 
 
 # Background rotation of __Secure-1PSIDTS (gemini_webapi start_auto_refresh → rotate_1psidts).
@@ -392,6 +485,64 @@ def resolve_cookies_for_request(
             ),
         )
     return merged
+
+
+async def resolve_cookies_for_request_async(
+    profile_id: str,
+    body_cookies: Optional[dict[str, Any]],
+) -> dict[str, str]:
+    """Async variant: loads on-disk cookies off the event loop."""
+    disk_path = profile_root_dir(profile_id) / "cookies.json"
+    from_disk = await _run_sync_io(load_cookies_json_file, disk_path)
+    from_body = None
+    if body_cookies:
+        from_body = normalize_gemini_web_cookies_from_parsed(body_cookies)
+    merged = merge_maps(from_disk, from_body)
+    if not merged or not merged.get("__Secure-1PSID"):
+        disk_exists = disk_path.is_file()
+        disk_ok = bool(from_disk and from_disk.get("__Secure-1PSID"))
+        log.warning(
+            "resolve_cookies: no __Secure-1PSID after merge profile=%s path=%s file_exists=%s disk_ok=%s",
+            profile_id,
+            disk_path,
+            disk_exists,
+            disk_ok,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Missing cookies for profile {profile_id!r}. "
+                f"On-disk path: {disk_path.resolve()} (file exists={disk_exists}, "
+                f"loaded valid __Secure-1PSID from disk={disk_ok}). "
+                "If /ui shows cookies saved, use the same server URL, pick that account in the tester, "
+                "or send header X-Gemini-Profile matching that profile (default profile id is 'default'). "
+                "Otherwise set cookies via POST /admin/api/profiles/{id}/cookies or include cookies in the JSON body."
+            ),
+        )
+    return merged
+
+
+def _prepare_generate_image_temp_files_sync(images: list[Any]) -> list[str]:
+    """Blocking: decode ImagePart list to temp files (runs in thread pool)."""
+    temp_paths: list[str] = []
+    for im in images:
+        mime = getattr(im, "mimeType", None) or ""
+        b64 = getattr(im, "base64", None) or ""
+        ext = mimetypes.guess_extension(str(mime).split(";")[0].strip()) or ".bin"
+        fd, path = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except Exception as e:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}") from e
+        with open(path, "wb") as f:
+            f.write(data)
+        temp_paths.append(path)
+    return temp_paths
 
 
 def apply_cookie_string_map_to_gemini_client(client: Any, cookie_map: dict[str, str]) -> None:
@@ -789,7 +940,7 @@ async def _get_or_create_client(profile_id: str, ck: dict[str, str]) -> Any:
         flat = extract_flat_cookie_map_from_client(client)
         norm = normalize_gemini_web_cookies_from_parsed(flat)
         if norm:
-            save_cookies_json_file(p, norm)
+            await _run_sync_io(save_cookies_json_file, p, norm)
         return client
 
 
@@ -799,13 +950,33 @@ async def _run_with_client(
     op: Callable[[Any], Awaitable[Any]],
 ) -> Any:
     client = await _get_or_create_client(profile_id, ck)
+    pid = _sanitize_profile_id(profile_id)
+    retry_max = max(0, _env_int("GEMINI_UPSTREAM_RETRY_MAX", 0))
+    base_ms = _env_float("GEMINI_UPSTREAM_RETRY_BASE_MS", 500.0)
     try:
-        return await op(client)
+        async with _upstream_concurrency_gate(profile_id):
+            for attempt in range(retry_max + 1):
+                try:
+                    return await op(client)
+                except Exception as e:
+                    if attempt >= retry_max or not _is_upstream_retryable(e):
+                        raise
+                    base_s = max(0.05, base_ms / 1000.0)
+                    delay = base_s * (2**attempt) + random.uniform(0, base_s)
+                    log.warning(
+                        "upstream retry profile=%s attempt=%s/%s sleep=%.2fs: %s",
+                        pid,
+                        attempt + 1,
+                        retry_max,
+                        delay,
+                        e,
+                    )
+                    await asyncio.sleep(delay)
     finally:
         flat = extract_flat_cookie_map_from_client(client)
         norm = normalize_gemini_web_cookies_from_parsed(flat)
         if norm:
-            save_cookies_json_file(profile_data_dir(profile_id) / "cookies.json", norm)
+            await _run_sync_io(save_cookies_json_file, profile_data_dir(pid) / "cookies.json", norm)
             try:
                 await state_store.record_cookie_persist_hint(profile_id=profile_id)
             except Exception:
@@ -814,10 +985,15 @@ async def _run_with_client(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _health_monitor_task
+    global _health_monitor_task, _sync_io_executor
     _attach_ring_buffer_handlers()
     log.info("gemini-api log buffer ready (root + uvicorn + uvicorn.access)")
     PROFILES_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
+    sync_threads = _env_int("GEMINI_SYNC_IO_THREADS", 0)
+    if sync_threads > 0:
+        n = max(1, min(sync_threads, 128))
+        _sync_io_executor = ThreadPoolExecutor(max_workers=n, thread_name_prefix="gemini_sync_io")
+        log.info("GEMINI_SYNC_IO_THREADS=%s (dedicated sync I/O pool)", n)
     await state_store.startup()
     if not ADMIN_API_KEY:
         log.warning("ADMIN_API_KEY is empty — admin routes disabled until set.")
@@ -839,6 +1015,9 @@ async def lifespan(app: FastAPI):
             pass
     _singleton_clients.clear()
     _singleton_ids.clear()
+    if _sync_io_executor is not None:
+        _sync_io_executor.shutdown(wait=True, cancel_futures=False)
+        _sync_io_executor = None
     await state_store.shutdown()
 
 
@@ -855,6 +1034,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    sync_pool = _env_int("GEMINI_SYNC_IO_THREADS", 0)
     return {
         "ok": True,
         "profilesRoot": str(PROFILES_ROOT),
@@ -863,6 +1043,10 @@ async def health() -> dict[str, Any]:
         "autoRotate": GEMINI_AUTO_ROTATE,
         "refreshIntervalSeconds": GEMINI_REFRESH_INTERVAL_SECONDS,
         "upstreamProxyConfigured": bool(GEMINI_UPSTREAM_PROXY),
+        "syncIoThreadsConfigured": sync_pool,
+        "maxConcurrentUpstreamGlobal": _UPSTREAM_GLOBAL_LIMIT,
+        "maxConcurrentUpstreamPerProfile": _UPSTREAM_PER_PROFILE_LIMIT,
+        "upstreamRetryMax": max(0, _env_int("GEMINI_UPSTREAM_RETRY_MAX", 0)),
         "redis": {
             "configured": state_store.redis_configured,
             "connected": state_store.redis_connected,
@@ -1025,7 +1209,7 @@ async def list_models(
 ) -> dict[str, Any]:
     _check_optional_client_key(x_gemini_api_key)
     pid = resolve_v1_profile(x_gemini_profile)
-    ck = resolve_cookies_for_request(pid, body.cookies)
+    ck = await resolve_cookies_for_request_async(pid, body.cookies)
 
     async def do_list(client: Any) -> dict[str, Any]:
         lm = getattr(client, "list_models", None)
@@ -1063,7 +1247,7 @@ async def generate(
     request_id = str(uuid.uuid4())
     _check_optional_client_key(x_gemini_api_key)
     pid = resolve_v1_profile(x_gemini_profile)
-    ck = resolve_cookies_for_request(pid, body.cookies)
+    ck = await resolve_cookies_for_request_async(pid, body.cookies)
     model_requested = (body.model or "").strip() or None
     prompt_len = len(body.prompt or "")
     n_img = len(body.images or [])
@@ -1076,21 +1260,8 @@ async def generate(
         )
 
     temp_paths: list[str] = []
-    for im in body.images or []:
-        ext = mimetypes.guess_extension(im.mimeType.split(";")[0].strip()) or ".bin"
-        fd, path = tempfile.mkstemp(suffix=ext)
-        os.close(fd)
-        try:
-            data = base64.b64decode(im.base64, validate=False)
-        except Exception as e:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}") from e
-        with open(path, "wb") as f:
-            f.write(data)
-        temp_paths.append(path)
+    if body.images:
+        temp_paths = await _run_sync_io(_prepare_generate_image_temp_files_sync, list(body.images))
 
     async def do_gen(client: Any) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
@@ -1208,7 +1379,7 @@ async def status(
 ) -> dict[str, Any]:
     _check_optional_client_key(x_gemini_api_key)
     pid = resolve_v1_profile(x_gemini_profile)
-    ck = resolve_cookies_for_request(pid, body.cookies)
+    ck = await resolve_cookies_for_request_async(pid, body.cookies)
 
     async def do_status(client: Any) -> dict[str, Any]:
         d = _account_status_fields_from_client(client)
@@ -1282,11 +1453,11 @@ async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Head
     path = (PROFILES_ROOT / pid / "cookies.json").resolve()
     if not path.is_file():
         return {"missing": True, "profile": pid}
-    ck = load_cookies_json_file(path)
+    ck = await _run_sync_io(load_cookies_json_file, path)
     if not ck:
         return {"missing": True, "profile": pid}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(await _run_sync_io(path.read_text, encoding="utf-8"))
         updated = raw.get("updatedAt") if isinstance(raw, dict) else None
     except (json.JSONDecodeError, OSError):
         updated = None
@@ -1331,7 +1502,7 @@ async def admin_save_cookies(profile_id: str, body: CookiesPayload, authorizatio
     ck = normalize_gemini_web_cookies_from_parsed(body.cookies)
     if not ck:
         raise HTTPException(status_code=400, detail="Could not normalize cookies (need __Secure-1PSID).")
-    save_cookies_json_file(profile_data_dir(pid) / "cookies.json", ck)
+    await _run_sync_io(save_cookies_json_file, profile_data_dir(pid) / "cookies.json", ck)
     await state_store.clear_account_status(pid)
     # Drop cached client for this profile so next request re-inits with new cookies
     if pid in _singleton_clients:
@@ -1365,7 +1536,7 @@ async def admin_profiles_auth_status(authorization: Optional[str] = Header(None)
 
     for pid in list_all_profile_ids_on_disk():
         disk_path = profile_root_dir(pid) / "cookies.json"
-        ck = load_cookies_json_file(disk_path)
+        ck = await _run_sync_io(load_cookies_json_file, disk_path)
         if not ck or not ck.get("__Secure-1PSID"):
             try:
                 await state_store.clear_account_status(pid)

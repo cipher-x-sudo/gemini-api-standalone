@@ -73,12 +73,26 @@ Start **this** `gemini-api-standalone` stack **once** so the network exists, the
 | `GEMINI_AUTO_ROTATE` | If `true`/`1`/`yes`/`on`, runs background **auto-rotation** of `__Secure-1PSIDTS` (same as upstream `auto_refresh`). Alias: `GEMINI_AUTO_REFRESH`. Default **true**. |
 | `GEMINI_REFRESH_INTERVAL_SECONDS` | Seconds between rotation attempts when auto-rotate is on (minimum **60**; library clamps lower values). Default **600**. |
 | `GEMINI_V1_DEFAULT_PROFILE` | Used when **`X-Gemini-Profile` is omitted**. Default **`default`**. Set to **`random`** (or `any` / `*`) to pick a **random** profile that already has saved `cookies.json` (same effect as sending header `X-Gemini-Profile: random`). |
+| `GEMINI_UVICORN_WORKERS` | Number of **uvicorn worker processes** inside the container (default **1**). Values greater than **1** improve parallel CPU throughput; each worker keeps its **own** in-memory `GeminiClient` cache (on-disk cookies remain shared). |
+| `GEMINI_SYNC_IO_THREADS` | If **greater than 0**, blocking disk work (cookie saves, large image staging, some admin reads) uses a **dedicated thread pool** of this size instead of only the default `asyncio` executor. Default **0**. |
+| `GEMINI_MAX_CONCURRENT_UPSTREAM_GLOBAL` | Maximum **concurrent** upstream Gemini operations **across all profiles** on this process. **0** = no limit (default). Helps reduce burst **429** responses. |
+| `GEMINI_MAX_CONCURRENT_UPSTREAM_PER_PROFILE` | Same, but **per profile id**. **0** = no limit (default). If `gemini_webapi` misbehaves with parallel calls on one session, set this to **1**. |
+| `GEMINI_UPSTREAM_RETRY_MAX` | After a **retryable** upstream rate limit (`UsageLimitExceeded`, `TemporarilyBlocked`, HTTP **429** in mapped errors), retry up to this many **extra** attempts (default **0**). Retries **re-invoke** the same operation and may consume additional quota. |
+| `GEMINI_UPSTREAM_RETRY_BASE_MS` | Base delay in milliseconds for exponential backoff between retries (default **500**). |
 
 Restart the service after changing rotation settings so existing Gemini clients are recreated.
 
 ### Auto-rotate (session cookies)
 
 The upstream client can run a background loop that refreshes Google session cookies (notably `__Secure-1PSIDTS`) so long-lived deployments stay authenticated. This service passes that through `GeminiClient.init(auto_refresh=…, refresh_interval=…)` and persists updated cookies under each profile’s `cookies.json`. Disable with `GEMINI_AUTO_ROTATE=false` if you prefer manual cookie updates only.
+
+### Concurrency and blocking I/O
+
+Heavy **disk** work and large **image** decoding run off the asyncio event loop (`asyncio.to_thread`, or a bounded pool when `GEMINI_SYNC_IO_THREADS` is set) so **`GET /health`** and unrelated routes stay responsive under load.
+
+**Upstream limits:** optional semaphores (`GEMINI_MAX_CONCURRENT_UPSTREAM_*`) serialize Gemini traffic to reduce burst **429** responses. **Retries** (`GEMINI_UPSTREAM_RETRY_*`) apply only to mapped rate-limit errors; each retry is a **new** upstream call and may count against quota.
+
+**Scaling:** `GEMINI_UVICORN_WORKERS` runs multiple uvicorn processes in one container. Use **Redis** (`REDIS_URL`) if you rely on shared auxiliary state (account-status cache, generation history); each worker still reads and writes **`cookies.json`** on the shared volume.
 
 ## HTTP API
 
@@ -88,7 +102,7 @@ Unless noted, JSON bodies use `Content-Type: application/json`.
 
 | Method | Path | Auth | Description |
 | ------ | ---- | ---- | ----------- |
-| `GET` | `/health` | None | Liveness: `ok`, paths, whether admin/client key are configured, **`autoRotate`**, **`refreshIntervalSeconds`**. |
+| `GET` | `/health` | None | Liveness: `ok`, paths, admin/client key flags, **`autoRotate`**, **`refreshIntervalSeconds`**, **`syncIoThreadsConfigured`**, **`maxConcurrentUpstreamGlobal`**, **`maxConcurrentUpstreamPerProfile`**, **`upstreamRetryMax`**, Redis connectivity. |
 | `GET` | `/` | None | Redirects to `/ui`. |
 | `GET` | `/ui` | None | Control panel HTML (cookie admin UI). |
 | `GET` | `/admin` | None | Redirects to `/ui`. |

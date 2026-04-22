@@ -37,6 +37,101 @@ async function fetchWithAuth(url: string, options: RequestInit = {}) {
   return response.json();
 }
 
+/** Public /v1/* calls: profile header + optional client key only (no admin Bearer). */
+export type V1DebugResult = {
+  ok: boolean;
+  status: number;
+  durationMs: number;
+  url: string;
+  method: string;
+  /** Safe-to-display header map (sensitive values masked). */
+  requestHeaders: Record<string, string>;
+  requestBody: unknown;
+  responseBody: unknown;
+  responseRaw: string;
+};
+
+function _v1Headers(profileId: string): Headers {
+  const headers = new Headers();
+  headers.set("Content-Type", "application/json");
+  headers.set("X-Gemini-Profile", profileId.trim());
+  const clientKey = getClientKey().trim();
+  if (clientKey) {
+    headers.set("X-Gemini-Api-Key", clientKey);
+  }
+  return headers;
+}
+
+function _headersForDisplay(h: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  h.forEach((v, k) => {
+    if (k.toLowerCase() === "x-gemini-api-key" && v.length > 8) {
+      out[k] = `${v.slice(0, 4)}…${v.slice(-4)}`;
+    } else {
+      out[k] = v;
+    }
+  });
+  return out;
+}
+
+async function _fetchV1Json(
+  path: string,
+  profileId: string,
+  requestBody: unknown,
+): Promise<V1DebugResult> {
+  const url = `${API_BASE}${path}`;
+  const headers = _v1Headers(profileId);
+  const body = JSON.stringify(requestBody ?? {});
+  const t0 = performance.now();
+  const res = await fetch(url, { method: "POST", headers, body });
+  const raw = await res.text();
+  const durationMs = Math.round(performance.now() - t0);
+  let responseBody: unknown = null;
+  try {
+    responseBody = raw ? JSON.parse(raw) : null;
+  } catch {
+    responseBody = { _parseError: true, raw };
+  }
+  const reqHdrs = new Headers(headers);
+  return {
+    ok: res.ok,
+    status: res.status,
+    durationMs,
+    url,
+    method: "POST",
+    requestHeaders: _headersForDisplay(reqHdrs),
+    requestBody,
+    responseBody,
+    responseRaw: raw.length > 48_000 ? `${raw.slice(0, 48_000)}\n… [truncated]` : raw,
+  };
+}
+
+export async function v1ListModels(profileId: string): Promise<V1DebugResult> {
+  return _fetchV1Json("/v1/list-models", profileId, { cookies: null });
+}
+
+export type V1GenerateBody = {
+  prompt: string;
+  model?: string | null;
+  responseMimeType?: string | null;
+  cookies?: Record<string, unknown> | null;
+};
+
+export async function v1Generate(profileId: string, body: V1GenerateBody): Promise<V1DebugResult> {
+  const payload: Record<string, unknown> = {
+    prompt: body.prompt ?? "",
+    cookies: body.cookies ?? null,
+  };
+  const m = (body.model ?? "").trim();
+  if (m) {
+    payload.model = m;
+  }
+  if (body.responseMimeType) {
+    payload.responseMimeType = body.responseMimeType;
+  }
+  return _fetchV1Json("/v1/generate", profileId, payload);
+}
+
 export type LogLine = { t: string; level: string; logger: string; msg: string };
 
 export type LogsResponse = {

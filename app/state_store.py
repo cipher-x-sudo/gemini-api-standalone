@@ -159,7 +159,7 @@ async def get_account_status(profile_id: str) -> Optional[dict[str, Any]]:
                     return data
         except Exception as e:
             log.warning("Redis GET account_status profile=%s: %s", profile_id, e)
-    return _load_disk(profile_id)
+    return await asyncio.to_thread(_load_disk, profile_id)
 
 
 async def set_account_status(profile_id: str, snapshot: dict[str, Any]) -> None:
@@ -181,7 +181,7 @@ async def set_account_status(profile_id: str, snapshot: dict[str, Any]) -> None:
             return
         except Exception as e:
             log.warning("Redis SET account_status profile=%s: %s — falling back to disk", profile_id, e)
-    _save_disk(profile_id, payload)
+    await asyncio.to_thread(_save_disk, profile_id, payload)
 
 
 async def clear_account_status(profile_id: str) -> None:
@@ -190,7 +190,7 @@ async def clear_account_status(profile_id: str) -> None:
             await _r.delete(_account_status_redis_key(profile_id))
         except Exception as e:
             log.warning("Redis DEL account_status profile=%s: %s", profile_id, e)
-    _unlink_disk(profile_id)
+    await asyncio.to_thread(_unlink_disk, profile_id)
 
 
 # --- Generic namespaced JSON (optional; for future rate limits, flags, etc.) ---
@@ -339,42 +339,7 @@ def _append_generation_disk_line(line: str) -> None:
         log.warning("generation history disk append failed: %s", e)
 
 
-async def record_generation_event(event: dict[str, Any]) -> None:
-    """
-    Record a /v1/generate outcome (success or mapped HTTP error). Payload should be JSON-serializable.
-    """
-    row = dict(event)
-    row.setdefault("recordedAt", _utc_now_iso())
-    line = json.dumps(row, ensure_ascii=False)
-    if _redis_active():
-        try:
-            key = _generations_redis_key()
-            max_n = _generations_max()
-            await _r.lpush(key, line)
-            await _r.ltrim(key, 0, max_n - 1)
-            return
-        except Exception as e:
-            log.warning("Redis LPUSH generations: %s — falling back to disk", e)
-    _append_generation_disk_line(line)
-
-
-async def list_generation_events(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-    lim = max(1, min(int(limit), 500))
-    off = max(0, int(offset))
-    out: list[dict[str, Any]] = []
-    if _redis_active():
-        try:
-            raw_rows = await _r.lrange(_generations_redis_key(), off, off + lim - 1)
-            for raw in raw_rows or []:
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(data, dict):
-                    out.append(data)
-            return out
-        except Exception as e:
-            log.warning("Redis LRANGE generations: %s — falling back to disk", e)
+def _list_generation_events_from_disk_sync(lim: int, off: int) -> list[dict[str, Any]]:
     path = _generations_disk_path()
     if not path.is_file():
         return []
@@ -394,3 +359,42 @@ async def list_generation_events(limit: int = 50, offset: int = 0) -> list[dict[
         if isinstance(data, dict):
             chunk.append(data)
     return chunk[off : off + lim]
+
+
+async def record_generation_event(event: dict[str, Any]) -> None:
+    """
+    Record a /v1/generate outcome (success or mapped HTTP error). Payload should be JSON-serializable.
+    """
+    row = dict(event)
+    row.setdefault("recordedAt", _utc_now_iso())
+    line = json.dumps(row, ensure_ascii=False)
+    if _redis_active():
+        try:
+            key = _generations_redis_key()
+            max_n = _generations_max()
+            await _r.lpush(key, line)
+            await _r.ltrim(key, 0, max_n - 1)
+            return
+        except Exception as e:
+            log.warning("Redis LPUSH generations: %s — falling back to disk", e)
+    await asyncio.to_thread(_append_generation_disk_line, line)
+
+
+async def list_generation_events(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 500))
+    off = max(0, int(offset))
+    out: list[dict[str, Any]] = []
+    if _redis_active():
+        try:
+            raw_rows = await _r.lrange(_generations_redis_key(), off, off + lim - 1)
+            for raw in raw_rows or []:
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict):
+                    out.append(data)
+            return out
+        except Exception as e:
+            log.warning("Redis LRANGE generations: %s — falling back to disk", e)
+    return await asyncio.to_thread(_list_generation_events_from_disk_sync, lim, off)

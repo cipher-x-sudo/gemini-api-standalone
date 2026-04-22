@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Sidebar } from "./components/layout/Sidebar";
 import { Header } from "./components/layout/Header";
 import { ProfilesPage } from "./pages/ProfilesPage";
+import { PlaygroundPage } from "./pages/PlaygroundPage";
 import { LogsPage } from "./pages/LogsPage";
 import { JobsPage } from "./pages/JobsPage";
 import { Toaster } from "@/components/ui/toaster";
@@ -30,6 +31,7 @@ function App() {
       <Layout>
         <Routes>
           <Route path="/" element={<ProfilesPage />} />
+          <Route path="/playground" element={<PlaygroundPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/jobs" element={<JobsPage />} />
         </Routes>

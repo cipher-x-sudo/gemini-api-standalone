@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { NavLink } from "react-router-dom";
-import { Users, FileText, Activity, Settings, Zap } from "lucide-react";
+import { Users, FileText, Activity, Settings, Zap, FlaskConical } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { useToast } from "@/hooks/use-toast";
 
 const navItems = [
   { icon: Users, label: "Profiles", path: "/" },
+  { icon: FlaskConical, label: "Playground", path: "/playground" },
   { icon: FileText, label: "Logs", path: "/logs" },
   { icon: Activity, label: "Jobs", path: "/jobs" },
 ];
