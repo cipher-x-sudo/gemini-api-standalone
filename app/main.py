@@ -429,14 +429,31 @@ def resolve_v1_profile(x_gemini_profile: Optional[str]) -> str:
 
 
 def save_cookies_json_file(path: Path, cookie_map: dict[str, str]) -> None:
+    """
+    Atomic write to path. Uses a unique temp name so concurrent workers/threads
+    (same profile, same fixed cookies.json.tmp) cannot clobber each other's tmp file.
+    """
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     payload = {
         "cookies": cookie_map,
         "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.",
+        suffix=".tmp",
+        dir=str(path.parent.resolve()),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     try:
         path.chmod(0o600)
     except OSError:

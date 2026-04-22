@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -91,9 +92,18 @@ def _save_disk(profile_id: str, payload: dict[str, Any]) -> None:
     parent = PROFILES_ROOT / profile_id
     parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     path = parent / _ACCOUNT_STATUS_DISK_NAME
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    fd, tmp_name = tempfile.mkstemp(prefix=".account_status.", suffix=".tmp", dir=str(parent.resolve()))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     try:
         path.chmod(0o600)
     except OSError:
