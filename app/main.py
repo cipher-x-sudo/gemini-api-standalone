@@ -79,7 +79,26 @@ class _RingBufferHandler(logging.Handler):
 
 _root_ring = _RingBufferHandler()
 _root_ring.setLevel(logging.DEBUG)
-logging.getLogger().addHandler(_root_ring)
+
+
+def _attach_ring_buffer_handlers() -> None:
+    """
+    Uvicorn's default LOGGING_CONFIG sets propagate=false on uvicorn / uvicorn.access,
+    so those records never reach the root logger. Attach our handler there too, and
+    re-run after startup in case dictConfig replaced root handlers.
+    """
+    targets: list[logging.Logger] = [
+        logging.getLogger(),
+        logging.getLogger("uvicorn"),
+        logging.getLogger("uvicorn.access"),
+    ]
+    for lg in targets:
+        if any(isinstance(h, _RingBufferHandler) for h in lg.handlers):
+            continue
+        lg.addHandler(_root_ring)
+
+
+_attach_ring_buffer_handlers()
 
 PROFILES_ROOT = Path(os.environ.get("GEMINI_PROFILES_ROOT", "/data/profiles")).resolve()
 ADMIN_API_KEY = (os.environ.get("ADMIN_API_KEY") or "").strip()
@@ -641,6 +660,8 @@ async def _run_with_client(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _attach_ring_buffer_handlers()
+    log.info("gemini-api log buffer ready (root + uvicorn + uvicorn.access)")
     PROFILES_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
     if not ADMIN_API_KEY:
         log.warning("ADMIN_API_KEY is empty — admin routes disabled until set.")
