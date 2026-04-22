@@ -4,6 +4,7 @@ Standalone Gemini Web API (gemini_webapi) for VPS/Docker.
 - Per-profile cookie dirs under GEMINI_PROFILES_ROOT; each sets GEMINI_COOKIE_PATH so the library
   persists rotated cookies (gemini_webapi background task: rotate_1psidts / save_cookies).
 - Optional env: GEMINI_AUTO_ROTATE (or GEMINI_AUTO_REFRESH), GEMINI_REFRESH_INTERVAL_SECONDS.
+- Optional upstream proxy: GEMINI_UPSTREAM_PROXY (alias GEMINI_PROXY) — full URL, or host:port:user:password with GEMINI_PROXY_SCHEME (default http). Passed to gemini_webapi.GeminiClient.
 - Nexus-compatible routes: POST /v1/list-models, /v1/generate, /v1/status (cookies optional if on-disk; X-Gemini-Profile: random or GEMINI_V1_DEFAULT_PROFILE=random). Upstream gemini_webapi errors map to HTTP 429/401/503 where applicable.
 - Admin: paste cookies per profile (Bearer ADMIN_API_KEY); GET /admin/api/profiles/auth-status scans all profiles’ session health.
 
@@ -31,6 +32,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -116,6 +118,47 @@ _attach_ring_buffer_handlers()
 PROFILES_ROOT = Path(os.environ.get("GEMINI_PROFILES_ROOT", "/data/profiles")).resolve()
 ADMIN_API_KEY = (os.environ.get("ADMIN_API_KEY") or "").strip()
 OPTIONAL_CLIENT_KEY = (os.environ.get("GEMINI_API_CLIENT_KEY") or "").strip()
+
+
+def _resolve_upstream_proxy_url() -> str | None:
+    """
+    GEMINI_UPSTREAM_PROXY / GEMINI_PROXY:
+    - Full URL if it contains '://' (e.g. http://..., socks5://...).
+    - Else treated as host:port:username:password (first three ':' only; rest is password, so ':' in password is OK).
+    - host:port or host:port:user also work.
+    GEMINI_PROXY_SCHEME defaults to http (use socks5, socks5h, https, etc. when needed).
+    """
+    raw = (os.environ.get("GEMINI_UPSTREAM_PROXY") or os.environ.get("GEMINI_PROXY") or "").strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        return raw
+    parts = raw.split(":", 3)
+    if len(parts) < 2:
+        log.warning("GEMINI_UPSTREAM_PROXY %r is not a URL and not host:port:… — proxy disabled", raw)
+        return None
+    host, port_s = parts[0].strip(), parts[1].strip()
+    user = parts[2].strip() if len(parts) > 2 else ""
+    password = parts[3] if len(parts) > 3 else ""
+    if not host or not port_s:
+        log.warning("GEMINI_UPSTREAM_PROXY host:port form is empty — proxy disabled")
+        return None
+    try:
+        int(port_s)
+    except ValueError:
+        log.warning("GEMINI_UPSTREAM_PROXY has invalid port %r — proxy disabled", port_s)
+        return None
+    scheme = (os.environ.get("GEMINI_PROXY_SCHEME") or "http").strip().lower()
+    scheme = scheme.split("://", 1)[-1] if "://" in scheme else scheme
+    scheme = scheme.rstrip("/") or "http"
+    if user and password:
+        return f"{scheme}://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port_s}"
+    if user:
+        return f"{scheme}://{quote(user, safe='')}@{host}:{port_s}"
+    return f"{scheme}://{host}:{port_s}"
+
+
+GEMINI_UPSTREAM_PROXY = _resolve_upstream_proxy_url()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -286,6 +329,55 @@ def resolve_v1_profile(x_gemini_profile: Optional[str]) -> str:
     if h.lower() in _PROFILE_RANDOM_ALIASES:
         return _pick_random_profile_id()
     return _sanitize_profile_id(h)
+
+
+_ACCOUNT_STATUS_CACHE_NAME = "account_status.json"
+
+
+def _account_status_cache_path(profile_id: str) -> Path:
+    return profile_root_dir(profile_id) / _ACCOUNT_STATUS_CACHE_NAME
+
+
+def load_account_status_cache(profile_id: str) -> Optional[dict[str, Any]]:
+    path = _account_status_cache_path(profile_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def save_account_status_cache(profile_id: str, snapshot: dict[str, Any]) -> None:
+    """Persist last successful POST /v1/status result; cleared when cookies are replaced."""
+    pid = _sanitize_profile_id(profile_id)
+    d = profile_data_dir(pid)
+    path = d / _ACCOUNT_STATUS_CACHE_NAME
+    payload = {
+        "status": snapshot.get("status"),
+        "description": snapshot.get("description") or "",
+        "authenticated": snapshot.get("authenticated"),
+        "checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def clear_account_status_cache(profile_id: str) -> None:
+    path = _account_status_cache_path(profile_id)
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def save_cookies_json_file(path: Path, cookie_map: dict[str, str]) -> None:
@@ -618,26 +710,31 @@ def _cookie_identity_hash(ck: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(items, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _client_singleton_signature(ck: dict[str, str]) -> str:
+    """Cookies + upstream proxy; changing either must rebuild GeminiClient."""
+    return _cookie_identity_hash(ck) + "\n" + (GEMINI_UPSTREAM_PROXY or "")
+
+
 async def _get_or_create_client(profile_id: str, ck: dict[str, str]) -> Any:
     from gemini_webapi import GeminiClient
 
     _set_gemini_cookie_path_for_profile(profile_id)
     pid = _sanitize_profile_id(profile_id)
-    cid = _cookie_identity_hash(ck)
+    sig = _client_singleton_signature(ck)
     if pid not in _singleton_locks:
         _singleton_locks[pid] = asyncio.Lock()
     lock = _singleton_locks[pid]
     async with lock:
         cur = _singleton_clients.get(pid)
         cur_sig = _singleton_ids.get(pid)
-        if cur is not None and cur_sig == cid:
+        if cur is not None and cur_sig == sig:
             apply_cookie_string_map_to_gemini_client(cur, ck)
             return cur
         if cur is not None:
             await _maybe_await_close(cur)
             _singleton_clients.pop(pid, None)
         psid, psidts = _psid_pair(ck)
-        client = GeminiClient(psid, psidts, proxy=None)
+        client = GeminiClient(psid, psidts, proxy=GEMINI_UPSTREAM_PROXY)
         apply_cookie_string_map_to_gemini_client(client, ck)
         await client.init(
             timeout=120,
@@ -647,7 +744,7 @@ async def _get_or_create_client(profile_id: str, ck: dict[str, str]) -> Any:
             refresh_interval=GEMINI_REFRESH_INTERVAL_SECONDS,
         )
         _singleton_clients[pid] = client
-        _singleton_ids[pid] = cid
+        _singleton_ids[pid] = sig
         p = profile_data_dir(pid) / "cookies.json"
         flat = extract_flat_cookie_map_from_client(client)
         norm = normalize_gemini_web_cookies_from_parsed(flat)
@@ -678,6 +775,8 @@ async def lifespan(app: FastAPI):
     PROFILES_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
     if not ADMIN_API_KEY:
         log.warning("ADMIN_API_KEY is empty — admin routes disabled until set.")
+    if GEMINI_UPSTREAM_PROXY:
+        log.info("GEMINI_UPSTREAM_PROXY is set — GeminiClient will use that proxy for upstream requests.")
     yield
     for pid, c in list(_singleton_clients.items()):
         try:
@@ -685,6 +784,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     _singleton_clients.clear()
+    _singleton_ids.clear()
 
 
 app = FastAPI(title="Gemini Web API (standalone)", version="1.0.0", lifespan=lifespan)
@@ -707,6 +807,7 @@ async def health() -> dict[str, Any]:
         "adminConfigured": bool(ADMIN_API_KEY),
         "autoRotate": GEMINI_AUTO_ROTATE,
         "refreshIntervalSeconds": GEMINI_REFRESH_INTERVAL_SECONDS,
+        "upstreamProxyConfigured": bool(GEMINI_UPSTREAM_PROXY),
     }
 
 
@@ -750,6 +851,7 @@ async def admin_server_info(authorization: Optional[str] = Header(None)) -> dict
         "adminConfigured": bool(ADMIN_API_KEY),
         "autoRotate": GEMINI_AUTO_ROTATE,
         "refreshIntervalSeconds": GEMINI_REFRESH_INTERVAL_SECONDS,
+        "upstreamProxyConfigured": bool(GEMINI_UPSTREAM_PROXY),
     }
 
 
@@ -907,6 +1009,10 @@ async def status(
                 out.get("authenticated"),
                 out.get("status"),
             )
+            try:
+                save_account_status_cache(pid, out)
+            except Exception as e:
+                log.warning("save_account_status_cache profile=%s: %s", pid, e)
         return out
     except HTTPException:
         raise
@@ -969,10 +1075,14 @@ async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Head
         updated = raw.get("updatedAt") if isinstance(raw, dict) else None
     except (json.JSONDecodeError, OSError):
         updated = None
+    cache = load_account_status_cache(pid)
     return {
         "profile": pid,
         "updatedAt": updated,
         "cookiesMasked": _mask_cookie_map_for_display(ck),
+        "lastAccountStatus": cache.get("status") if cache else None,
+        "lastAccountStatusCheckedAt": cache.get("checkedAt") if cache else None,
+        "lastAccountStatusDescription": cache.get("description") if cache else None,
     }
 
 
@@ -1006,6 +1116,7 @@ async def admin_save_cookies(profile_id: str, body: CookiesPayload, authorizatio
     if not ck:
         raise HTTPException(status_code=400, detail="Could not normalize cookies (need __Secure-1PSID).")
     save_cookies_json_file(profile_data_dir(pid) / "cookies.json", ck)
+    clear_account_status_cache(pid)
     # Drop cached client for this profile so next request re-inits with new cookies
     if pid in _singleton_clients:
         c = _singleton_clients.pop(pid)

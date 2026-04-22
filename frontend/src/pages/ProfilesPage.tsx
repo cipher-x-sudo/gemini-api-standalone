@@ -45,7 +45,9 @@ export function ProfilesPage() {
             const ck = await api.getCookies(id);
             return {
               id,
-              status: "UNKNOWN",
+              status: (typeof ck.lastAccountStatus === "string" && ck.lastAccountStatus)
+                ? ck.lastAccountStatus
+                : "UNKNOWN",
               cookiesMasked: ck.cookiesMasked || {},
               updatedAt: ck.updatedAt || "Never"
             };
