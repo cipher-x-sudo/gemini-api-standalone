@@ -319,6 +319,65 @@ def profile_data_dir(profile_id: str) -> Path:
     return d
 
 
+PROFILE_META_FILE = "profile_meta.json"
+
+
+def _profile_meta_path(profile_id: str) -> Path:
+    return (profile_root_dir(profile_id) / PROFILE_META_FILE).resolve()
+
+
+def load_profile_meta_file(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+        d = json.loads(raw)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def save_profile_meta_file(path: Path, email: str | None) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    t = (email or "").strip()
+    if t:
+        path.write_text(
+            json.dumps({"email": t}, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    else:
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _generate_unique_profile_id() -> str:
+    for _ in range(64):
+        candidate = "p" + secrets.token_hex(8)
+        if not _PROFILE_ID_RE.match(candidate):
+            continue
+        p = PROFILES_ROOT / candidate
+        if not p.is_dir():
+            return candidate
+    raise HTTPException(
+        status_code=503,
+        detail="Could not allocate a unique profile id; retry or set profileId manually.",
+    )
+
+
+def _is_auto_profile_id_request(s: str | None) -> bool:
+    t = (s or "").strip()
+    if not t:
+        return True
+    return t.lower() in ("auto", "random")
+
+
 def _set_gemini_cookie_path_for_profile(profile_id: str) -> Path:
     d = profile_data_dir(profile_id)
     os.environ["GEMINI_COOKIE_PATH"] = str(d)
@@ -1479,11 +1538,18 @@ class CookiesPayload(BaseModel):
 
 
 class CreateProfilePayload(BaseModel):
-    profileId: str = Field(..., min_length=1, max_length=63)
+    """Omit profileId or use \"auto\"/\"random\" (or empty) to assign a random id (e.g. p1a2b3c4d5e6f7a8)."""
+
+    profileId: str | None = Field(default=None, max_length=63)
+    email: str | None = Field(default=None, max_length=320, description="Optional label (e.g. Google account email).")
     cookies: Any | None = Field(
         default=None,
         description="Optional. Same JSON shapes as POST /admin/api/profiles/{id}/cookies.",
     )
+
+
+class ProfileLabelPayload(BaseModel):
+    email: str | None = Field(default=None, max_length=320)
 
 
 @app.get("/admin/api/profiles/{profile_id}/cookies")
@@ -1491,11 +1557,18 @@ async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Head
     _check_admin(authorization)
     pid = _sanitize_profile_id(profile_id)
     path = (PROFILES_ROOT / pid / "cookies.json").resolve()
+    meta_email = None
+    try:
+        m0 = await _run_sync_io(load_profile_meta_file, _profile_meta_path(pid))
+        if isinstance(m0.get("email"), str) and m0.get("email"):
+            meta_email = m0.get("email")
+    except Exception:
+        pass
     if not path.is_file():
-        return {"missing": True, "profile": pid}
+        return {"missing": True, "profile": pid, "email": meta_email}
     ck = await _run_sync_io(load_cookies_json_file, path)
     if not ck:
-        return {"missing": True, "profile": pid}
+        return {"missing": True, "profile": pid, "email": meta_email}
     try:
         raw = json.loads(await _run_sync_io(path.read_text, encoding="utf-8"))
         updated = raw.get("updatedAt") if isinstance(raw, dict) else None
@@ -1507,6 +1580,7 @@ async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Head
         last_status = "UNAUTHENTICATED"
     return {
         "profile": pid,
+        "email": meta_email,
         "updatedAt": updated,
         "cookiesMasked": _mask_cookie_map_for_display(ck),
         "lastAccountStatus": last_status,
@@ -1515,11 +1589,99 @@ async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Head
     }
 
 
+async def _refresh_account_status_after_cookies_write(pid: str) -> dict[str, Any] | None:
+    """
+    After cookies.json is written, run the same Gemini account_status probe as one row in
+    GET /admin/api/profiles/auth-status and persist via state_store.
+    Returns a short dict for API JSON, or None if there is no __Secure-1PSID on disk.
+    """
+    disk_path = (profile_root_dir(pid) / "cookies.json").resolve()
+    ck = await _run_sync_io(load_cookies_json_file, disk_path)
+    if not ck or not ck.get("__Secure-1PSID"):
+        try:
+            await state_store.clear_account_status(pid)
+        except Exception as e:
+            log.warning("clear_account_status profile=%s (post-cookie, no psid): %s", pid, e)
+        return None
+
+    async def do_probe(client: Any) -> dict[str, Any]:
+        return _account_status_fields_from_client(client)
+
+    try:
+        snap = await asyncio.wait_for(_run_with_client(pid, ck, do_probe), timeout=120.0)
+        try:
+            await state_store.set_account_status(pid, snap)
+        except Exception as e:
+            log.warning("set_account_status profile=%s (post-cookie refresh): %s", pid, e)
+        log.info(
+            "auth re-check after cookie write profile=%s account_status=%s authenticated=%s",
+            pid,
+            snap.get("status"),
+            snap.get("authenticated"),
+        )
+        return {
+            "ok": True,
+            "status": str(snap.get("status", "")),
+            "authenticated": bool(snap.get("authenticated")),
+            "description": (snap.get("description") or "") if isinstance(snap.get("description"), str) else "",
+        }
+    except asyncio.TimeoutError:
+        row = {
+            "status": "TIMEOUT",
+            "description": "Client init or status probe exceeded 120s.",
+            "authenticated": False,
+        }
+        try:
+            await state_store.set_account_status(pid, row)
+        except Exception as e:
+            log.warning("set_account_status profile=%s (TIMEOUT post-cookie): %s", pid, e)
+        return {
+            "ok": False,
+            "status": "TIMEOUT",
+            "error": "timeout after 120s",
+            "authenticated": False,
+            "description": row["description"],
+        }
+    except Exception as e:
+        he = _http_exception_from_upstream(pid, e)
+        err_detail = he.detail
+        if not isinstance(err_detail, str):
+            err_detail = json.dumps(err_detail, ensure_ascii=False)
+        st = {
+            "status": "PROBE_ERROR",
+            "description": str(err_detail or ""),
+            "authenticated": False,
+        }
+        try:
+            await state_store.set_account_status(pid, st)
+        except Exception as e2:
+            log.warning("set_account_status profile=%s (PROBE_ERROR post-cookie): %s", pid, e2)
+        return {
+            "ok": False,
+            "status": "PROBE_ERROR",
+            "error": err_detail,
+            "httpStatus": he.status_code,
+            "authenticated": False,
+        }
+
+
 @app.post("/admin/api/profiles")
 async def admin_create_profile(body: CreateProfilePayload, authorization: Optional[str] = Header(None)) -> JSONResponse:
     _check_admin(authorization)
-    pid = _sanitize_profile_id(body.profileId.strip())
+    use_auto = _is_auto_profile_id_request(body.profileId)
+    if use_auto:
+        pid = _generate_unique_profile_id()
+    else:
+        pid = _sanitize_profile_id((body.profileId or "").strip())
+        if (PROFILES_ROOT / pid).is_dir():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Profile {pid!r} already exists. Choose another id or omit profileId for auto.",
+            )
     profile_data_dir(pid)
+    email_set = (body.email or "").strip() or None
+    if email_set:
+        await _run_sync_io(save_profile_meta_file, _profile_meta_path(pid), email_set)
     if body.cookies is not None:
         try:
             pl = CookiesPayload.model_validate(body.cookies)
@@ -1536,7 +1698,18 @@ async def admin_create_profile(body: CreateProfilePayload, authorization: Option
             await state_store.clear_account_status(pid)
         except Exception as e:
             log.warning("clear_account_status profile=%s (create+ cookies): %s", pid, e)
-    return JSONResponse({"ok": True, "profile": pid, "cookiesSaved": body.cookies is not None})
+    extra: dict[str, Any] = {
+        "ok": True,
+        "profile": pid,
+        "email": email_set,
+        "cookiesSaved": body.cookies is not None,
+        "autoAssignedId": use_auto,
+    }
+    if body.cookies is not None:
+        auth_snap = await _refresh_account_status_after_cookies_write(pid)
+        if auth_snap is not None:
+            extra["authCheck"] = auth_snap
+    return JSONResponse(extra)
 
 
 @app.delete("/admin/api/profiles/{profile_id}")
@@ -1568,7 +1741,25 @@ async def admin_save_cookies(profile_id: str, body: CookiesPayload, authorizatio
         c = _singleton_clients.pop(pid)
         await _maybe_await_close(c)
     _singleton_ids.pop(pid, None)
-    return JSONResponse({"ok": True, "profile": pid})
+    auth_ex: dict[str, Any] = {"ok": True, "profile": pid}
+    auth_snap = await _refresh_account_status_after_cookies_write(pid)
+    if auth_snap is not None:
+        auth_ex["authCheck"] = auth_snap
+    return JSONResponse(auth_ex)
+
+
+@app.put("/admin/api/profiles/{profile_id}/label")
+async def admin_put_profile_label(
+    profile_id: str, body: ProfileLabelPayload, authorization: Optional[str] = Header(None)
+) -> JSONResponse:
+    """Set or clear the optional email / label in profile_meta.json for this profile."""
+    _check_admin(authorization)
+    pid = _sanitize_profile_id(profile_id)
+    if not profile_root_dir(pid).is_dir():
+        raise HTTPException(status_code=404, detail=f"Profile {pid!r} not found")
+    t = (body.email or "").strip() or None
+    await _run_sync_io(save_profile_meta_file, _profile_meta_path(pid), t)
+    return JSONResponse({"ok": True, "profile": pid, "email": t})
 
 
 @app.get("/admin/api/profiles")

@@ -187,13 +187,42 @@ export const api = {
   getLogs: (limit = 800) =>
     fetchWithAuth(`/admin/api/logs?limit=${encodeURIComponent(String(limit))}`) as Promise<LogsResponse>,
   getProfiles: () => fetchWithAuth("/admin/api/profiles"),
-  createProfile: (profileId: string, cookies?: unknown) =>
-    fetchWithAuth("/admin/api/profiles", {
+  createProfile: (opts: {
+    profileId?: string | null;
+    email?: string | null;
+    cookies?: unknown;
+  }) => {
+    const body: Record<string, unknown> = {};
+    const pid = (opts.profileId ?? "").trim();
+    if (pid) {
+      body.profileId = pid;
+    } else {
+      body.profileId = "auto";
+    }
+    const em = (opts.email ?? "").trim();
+    if (em) {
+      body.email = em;
+    }
+    if (opts.cookies !== undefined) {
+      body.cookies = opts.cookies;
+    }
+    return fetchWithAuth("/admin/api/profiles", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(
-        cookies !== undefined && cookies !== null ? { profileId, cookies } : { profileId },
-      ),
+      body: JSON.stringify(body),
+    }) as Promise<{
+      ok?: boolean;
+      profile?: string;
+      email?: string | null;
+      cookiesSaved?: boolean;
+      autoAssignedId?: boolean;
+    }>;
+  },
+  setProfileLabel: (profileId: string, email: string | null) =>
+    fetchWithAuth(`/admin/api/profiles/${encodeURIComponent(profileId)}/label`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email && email.trim() ? email.trim() : null }),
     }),
   deleteProfile: (profileId: string) => 
     fetchWithAuth(`/admin/api/profiles/${profileId}`, { method: "DELETE" }),

@@ -11,6 +11,7 @@ import { api, getAdminKey } from "@/lib/api";
 
 type ProfileDetails = {
   id: string;
+  email: string | null;
   status: string;
   cookiesMasked: Record<string, string>;
   updatedAt: string | null;
@@ -22,11 +23,14 @@ export function ProfilesPage() {
   const [loading, setLoading] = useState(true);
   
   // Modals
+  const [useCustomProfileId, setUseCustomProfileId] = useState(false);
   const [newProfileId, setNewProfileId] = useState("");
+  const [newProfileEmail, setNewProfileEmail] = useState("");
   const [newProfileCookies, setNewProfileCookies] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [cookieOpen, setCookieOpen] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState("");
+  const [labelEmail, setLabelEmail] = useState("");
   const [cookiesInput, setCookiesInput] = useState("");
 
   const loadProfiles = async (opts?: { probeLiveAuth?: boolean }) => {
@@ -59,6 +63,7 @@ export function ProfilesPage() {
             const ck = await api.getCookies(id);
             return {
               id,
+              email: typeof (ck as { email?: string | null }).email === "string" ? (ck as { email: string }).email : null,
               status: (typeof ck.lastAccountStatus === "string" && ck.lastAccountStatus)
                 ? ck.lastAccountStatus
                 : "UNKNOWN",
@@ -66,7 +71,7 @@ export function ProfilesPage() {
               updatedAt: ck.updatedAt || "Never"
             };
           } catch (e) {
-            return { id, status: "ERROR", cookiesMasked: {}, updatedAt: null };
+            return { id, email: null, status: "ERROR", cookiesMasked: {}, updatedAt: null };
           }
         })
       );
@@ -94,7 +99,13 @@ export function ProfilesPage() {
   }, []);
 
   const handleCreateProfile = async () => {
-    if (!newProfileId) return;
+    if (useCustomProfileId) {
+      const custom = newProfileId.trim();
+      if (!custom) {
+        toast({ title: "Profile ID required", description: "Enter a profile id or turn off “Custom profile id”.", variant: "destructive" });
+        return;
+      }
+    }
     const raw = newProfileCookies.trim();
     let cookiesPayload: unknown | undefined;
     if (raw) {
@@ -110,16 +121,23 @@ export function ProfilesPage() {
       }
     }
     try {
-      await api.createProfile(newProfileId, cookiesPayload);
+      const res = await api.createProfile({
+        profileId: useCustomProfileId ? newProfileId.trim() : null,
+        email: newProfileEmail.trim() || null,
+        cookies: cookiesPayload,
+      });
+      const id = res.profile ?? "(unknown)";
       toast({
         title: "Profile Created",
         description:
-          raw.length > 0
-            ? `Profile ${newProfileId} was created and cookies were saved.`
-            : `Profile ${newProfileId} has been created.`,
+          (raw.length > 0
+            ? `Profile ${id} was created and cookies were saved.`
+            : `Profile ${id} has been created.`) + (res.autoAssignedId ? " (id was assigned automatically.)" : ""),
       });
       setCreateOpen(false);
+      setUseCustomProfileId(false);
       setNewProfileId("");
+      setNewProfileEmail("");
       setNewProfileCookies("");
       loadProfiles();
     } catch (e: any) {
@@ -138,18 +156,25 @@ export function ProfilesPage() {
   };
 
   const handleSaveCookies = async () => {
+    const raw = cookiesInput.trim();
     try {
-      let parsed;
-      try {
-        parsed = JSON.parse(cookiesInput);
-      } catch (e) {
-        toast({ title: "Invalid JSON", description: "Please paste a valid JSON array or object.", variant: "destructive" });
-        return;
+      await api.setProfileLabel(selectedProfile, labelEmail.trim() || null);
+      if (raw) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          toast({ title: "Invalid JSON", description: "Please paste a valid JSON array or object.", variant: "destructive" });
+          return;
+        }
+        await api.setCookies(selectedProfile, parsed);
+        toast({ title: "Saved", description: `Updated label and cookies for ${selectedProfile}.` });
+      } else {
+        toast({ title: "Label saved", description: `Updated label for ${selectedProfile} (cookies unchanged).` });
       }
-      await api.setCookies(selectedProfile, parsed);
-      toast({ title: "Cookies Saved", description: `Updated cookies for ${selectedProfile}.` });
       setCookieOpen(false);
       setCookiesInput("");
+      setLabelEmail("");
       loadProfiles();
     } catch (e: any) {
       toast({ title: "Error", description: e.message, variant: "destructive" });
@@ -193,7 +218,9 @@ export function ProfilesPage() {
             onOpenChange={(open) => {
               setCreateOpen(open);
               if (!open) {
+                setUseCustomProfileId(false);
                 setNewProfileId("");
+                setNewProfileEmail("");
                 setNewProfileCookies("");
               }
             }}
@@ -208,21 +235,46 @@ export function ProfilesPage() {
               <DialogHeader>
                 <DialogTitle>Create Profile</DialogTitle>
                 <DialogDescription>
-                  Enter a unique profile id (letters, digits, <code className="text-xs">._-</code>). Optionally paste Gemini
-                  cookies in the same step.
+                  By default a random profile id is assigned (e.g. <code className="text-xs">p…</code>). Optionally set a
+                  label email and paste cookies. Use a custom id only if you need a fixed name.
                 </DialogDescription>
               </DialogHeader>
               <div className="grid gap-4 py-2">
+                <label className="flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useCustomProfileId}
+                    onChange={(e) => setUseCustomProfileId(e.target.checked)}
+                    className="rounded border-border"
+                  />
+                  <span>Custom profile id (otherwise auto-generated)</span>
+                </label>
+                {useCustomProfileId && (
+                  <div className="grid grid-cols-4 items-center gap-4">
+                    <Label htmlFor="profileId" className="text-right">
+                      Profile ID
+                    </Label>
+                    <Input
+                      id="profileId"
+                      value={newProfileId}
+                      onChange={(e) => setNewProfileId(e.target.value)}
+                      placeholder="my-profile"
+                      className="col-span-3"
+                    />
+                  </div>
+                )}
                 <div className="grid grid-cols-4 items-center gap-4">
-                  <Label htmlFor="profileId" className="text-right">
-                    Profile ID
+                  <Label htmlFor="newProfileEmail" className="text-right">
+                    Label / email
                   </Label>
                   <Input
-                    id="profileId"
-                    value={newProfileId}
-                    onChange={(e) => setNewProfileId(e.target.value)}
-                    placeholder="my-profile"
+                    id="newProfileEmail"
+                    type="email"
+                    value={newProfileEmail}
+                    onChange={(e) => setNewProfileEmail(e.target.value)}
+                    placeholder="you@gmail.com (optional)"
                     className="col-span-3"
+                    autoComplete="off"
                   />
                 </div>
                 <div className="grid gap-2">
@@ -253,7 +305,8 @@ export function ProfilesPage() {
           <Table>
             <TableHeader className="bg-white/[0.02]">
               <TableRow className="border-border/50 hover:bg-transparent">
-                <TableHead className="w-[200px] pl-6">Profile ID</TableHead>
+                <TableHead className="w-[min(14rem,28vw)] pl-6">Profile ID</TableHead>
+                <TableHead className="min-w-[10rem]">Label / email</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Cookies</TableHead>
                 <TableHead>Last Updated</TableHead>
@@ -263,7 +316,7 @@ export function ProfilesPage() {
             <TableBody>
               {profiles.length === 0 && !loading && (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center py-8 text-muted-foreground">
+                  <TableCell colSpan={6} className="text-center py-8 text-muted-foreground">
                     No profiles found or invalid API key. Try setting your Admin API Key in the Settings menu.
                   </TableCell>
                 </TableRow>
@@ -279,7 +332,12 @@ export function ProfilesPage() {
                 const isAuthenticated = Boolean(profile.status) && !failedAuth && !uncertain;
                 return (
                 <TableRow key={profile.id} className="border-border/50 hover:bg-white/[0.04] transition-colors group">
-                  <TableCell className="font-medium pl-6">{profile.id}</TableCell>
+                  <TableCell className="font-mono text-xs pl-6 max-w-[14rem] truncate" title={profile.id}>
+                    {profile.id}
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground max-w-[12rem] truncate" title={profile.email || undefined}>
+                    {profile.email || "—"}
+                  </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-2">
                       <div className={`h-2 w-2 rounded-full ${isAuthenticated ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : (profile.status === 'UNKNOWN' ? 'bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.5)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]')} animate-pulse`} />
@@ -297,7 +355,17 @@ export function ProfilesPage() {
                       <Button variant="ghost" size="icon" onClick={() => handleCheckStatus(profile.id)} className="h-8 w-8 text-blue-400 hover:text-blue-300 hover:bg-blue-400/10" title="Check Account Status">
                         <Activity className="h-4 w-4" />
                       </Button>
-                      <Button variant="ghost" size="icon" onClick={() => { setSelectedProfile(profile.id); setCookieOpen(true); }} className="h-8 w-8 text-indigo-400 hover:text-indigo-300 hover:bg-indigo-400/10" title="Update Cookies">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => {
+                          setSelectedProfile(profile.id);
+                          setLabelEmail(profile.email || "");
+                          setCookieOpen(true);
+                        }}
+                        className="h-8 w-8 text-indigo-400 hover:text-indigo-300 hover:bg-indigo-400/10"
+                        title="Update label and cookies"
+                      >
                         <Key className="h-4 w-4" />
                       </Button>
                       <Button variant="ghost" size="icon" onClick={() => handleDeleteProfile(profile.id)} className="h-8 w-8 text-red-400 hover:text-red-300 hover:bg-red-400/10" title="Delete Profile">
@@ -315,22 +383,38 @@ export function ProfilesPage() {
       <Dialog open={cookieOpen} onOpenChange={setCookieOpen}>
         <DialogContent className="sm:max-w-[500px]">
           <DialogHeader>
-            <DialogTitle>Update Cookies: {selectedProfile}</DialogTitle>
+            <DialogTitle>Profile: {selectedProfile}</DialogTitle>
             <DialogDescription>
-              Paste your Gemini cookies below. You can paste a JSON array from an extension or a flat map.
+              Set a label (email) to remember this account. Paste new cookies only when you want to replace the saved
+              session; leave the JSON box empty to update the label only.
             </DialogDescription>
           </DialogHeader>
-          <div className="grid gap-4 py-4">
-            <textarea 
-              className="w-full h-40 bg-black/50 border border-border/50 rounded-md p-3 text-sm text-foreground font-mono focus:outline-none focus:ring-1 focus:ring-primary"
-              placeholder='[{"name": "__Secure-1PSID", "value": "..."}]'
-              value={cookiesInput}
-              onChange={(e) => setCookiesInput(e.target.value)}
-            />
+          <div className="grid gap-3 py-2">
+            <div className="grid gap-2">
+              <Label htmlFor="labelEmail">Label / email</Label>
+              <Input
+                id="labelEmail"
+                type="email"
+                value={labelEmail}
+                onChange={(e) => setLabelEmail(e.target.value)}
+                placeholder="you@gmail.com"
+                autoComplete="off"
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="cookiesJson">Cookie JSON (optional)</Label>
+              <textarea
+                id="cookiesJson"
+                className="w-full h-40 bg-black/50 border border-border/50 rounded-md p-3 text-sm text-foreground font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+                placeholder='[{"name": "__Secure-1PSID", "value": "..."}]'
+                value={cookiesInput}
+                onChange={(e) => setCookiesInput(e.target.value)}
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCookieOpen(false)}>Cancel</Button>
-            <Button onClick={handleSaveCookies}>Save Cookies</Button>
+            <Button onClick={handleSaveCookies}>Save</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
