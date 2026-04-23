@@ -81,6 +81,12 @@ docker compose --env-file .env up -d --build
 
 Open **`http://localhost:4000/ui`** or your public URL via Cloudflare.
 
+The API container bakes in **`frontend/dist`** at **image build time**. After you change the React UI, rebuild and redeploy so the browser gets the new bundle, for example:
+
+```bash
+docker compose build --no-cache gemini-api && docker compose up -d gemini-api
+```
+
 ### Same tunnel must reach `frontend` and `gemini-api`
 
 This stack creates **`gemini-prismacreative-net`**. Your **Portico** (or other) services must **join that network** so Cloudflare routes like `http://frontend:80` still resolve.

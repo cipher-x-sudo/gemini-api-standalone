@@ -240,6 +240,14 @@ export function ProfilesPage() {
                 </DialogDescription>
               </DialogHeader>
               <div className="grid gap-4 py-2">
+                {!useCustomProfileId && (
+                  <div className="rounded-md border border-primary/25 bg-primary/5 px-3 py-2.5 text-sm text-muted-foreground">
+                    <span className="font-medium text-foreground">Auto profile id</span> — a unique id like{" "}
+                    <code className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-xs">p1a2b3c4d5e6f7a8</code> will be
+                    assigned. Add <span className="text-foreground">Label / email</span> below so you remember which
+                    Google account it is.
+                  </div>
+                )}
                 <label className="flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
                   <input
                     type="checkbox"
@@ -247,7 +255,7 @@ export function ProfilesPage() {
                     onChange={(e) => setUseCustomProfileId(e.target.checked)}
                     className="rounded border-border"
                   />
-                  <span>Custom profile id (otherwise auto-generated)</span>
+                  <span>Use custom profile id instead</span>
                 </label>
                 {useCustomProfileId && (
                   <div className="grid grid-cols-4 items-center gap-4">
