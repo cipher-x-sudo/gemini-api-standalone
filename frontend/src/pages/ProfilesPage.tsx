@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo } from "react";
-import { Plus, Trash2, Key, RefreshCw, Activity, Search } from "lucide-react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { Plus, Trash2, Key, RefreshCw, Activity, Search, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -8,6 +8,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { api, getAdminKey } from "@/lib/api";
+import {
+  parseProfilesCookiesCsv,
+  rowHasPsidCookie,
+  validateProfileId,
+} from "@/lib/csvProfiles";
 
 type ProfileDetails = {
   id: string;
@@ -33,6 +38,9 @@ export function ProfilesPage() {
   const [labelEmail, setLabelEmail] = useState("");
   const [cookiesInput, setCookiesInput] = useState("");
   const [profileSearch, setProfileSearch] = useState("");
+  const [importOpen, setImportOpen] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const csvFileInputRef = useRef<HTMLInputElement>(null);
 
   const filteredProfiles = useMemo(() => {
     const q = profileSearch.trim().toLowerCase();
@@ -196,6 +204,81 @@ export function ProfilesPage() {
     }
   };
 
+  const isProfileAlreadyExistsError = (msg: string) =>
+    /\b409\b/i.test(msg) || /already exists/i.test(msg);
+
+  const handleCsvFileSelected = async (file: File | null) => {
+    if (!file) {
+      return;
+    }
+    const text = await file.text();
+    const parsed = parseProfilesCookiesCsv(text);
+    if (!parsed.ok) {
+      toast({ title: "Invalid CSV", description: parsed.error, variant: "destructive" });
+      return;
+    }
+    setImporting(true);
+    let created = 0;
+    let updated = 0;
+    let skipped = 0;
+    const failures: string[] = [];
+    for (const row of parsed.rows) {
+      const idErr = validateProfileId(row.profileId);
+      if (idErr) {
+        skipped++;
+        failures.push(`Line ${row.lineNumber}: ${idErr}`);
+        continue;
+      }
+      if (!rowHasPsidCookie(row.cookies)) {
+        skipped++;
+        failures.push(`Line ${row.lineNumber}: missing __Secure-1PSID / __Secure-3PSID`);
+        continue;
+      }
+      const pid = row.profileId.trim();
+      try {
+        await api.createProfile({
+          profileId: pid,
+          email: null,
+          cookies: row.cookies,
+        });
+        created++;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (isProfileAlreadyExistsError(msg)) {
+          try {
+            await api.setCookies(pid, row.cookies);
+            updated++;
+          } catch (e2: unknown) {
+            skipped++;
+            failures.push(
+              `Line ${row.lineNumber} (${pid}): ${e2 instanceof Error ? e2.message : String(e2)}`,
+            );
+          }
+        } else {
+          skipped++;
+          failures.push(`Line ${row.lineNumber} (${pid}): ${msg}`);
+        }
+      }
+    }
+    setImporting(false);
+    setImportOpen(false);
+    if (csvFileInputRef.current) {
+      csvFileInputRef.current.value = "";
+    }
+    await loadProfiles();
+    const okTotal = created + updated;
+    toast({
+      title: "CSV import finished",
+      description:
+        `${okTotal} profile(s) saved (${created} new, ${updated} updated).` +
+        (skipped ? ` ${skipped} skipped.` : "") +
+        (failures.length
+          ? ` First issues: ${failures.slice(0, 3).join(" · ")}${failures.length > 3 ? " …" : ""}`
+          : ""),
+      variant: failures.length && okTotal === 0 ? "destructive" : "default",
+    });
+  };
+
   const handleCheckStatus = async (id: string) => {
     try {
       const res = await api.checkStatus(id);
@@ -217,7 +300,29 @@ export function ProfilesPage() {
           <h1 className="text-3xl font-bold tracking-tight text-foreground">Profiles</h1>
           <p className="text-muted-foreground mt-1">Manage your Gemini API authentication profiles.</p>
         </div>
-        <div className="flex gap-3">
+        <div className="flex flex-wrap gap-3">
+          <input
+            ref={csvFileInputRef}
+            type="file"
+            accept=".csv,text/csv"
+            className="hidden"
+            aria-hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0] ?? null;
+              void handleCsvFileSelected(f);
+            }}
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setImportOpen(true)}
+            disabled={loading || importing || !getAdminKey()}
+            title={!getAdminKey() ? "Set Admin API Key in the header menu first" : "Import profiles from CSV"}
+          >
+            <Upload className="mr-2 h-4 w-4 shrink-0" />
+            <span className="hidden sm:inline">Import CSV</span>
+            <span className="sm:hidden">CSV</span>
+          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -313,6 +418,44 @@ export function ProfilesPage() {
               </div>
               <DialogFooter>
                 <Button onClick={handleCreateProfile}>Create</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          <Dialog open={importOpen} onOpenChange={setImportOpen}>
+            <DialogContent className="sm:max-w-[520px]">
+              <DialogHeader>
+                <DialogTitle>Import profiles from CSV</DialogTitle>
+                <DialogDescription asChild>
+                  <div className="space-y-3 text-sm text-muted-foreground">
+                    <p>
+                      First row must be headers. Profile id comes from{" "}
+                      <code className="rounded bg-black/30 px-1 font-mono text-xs">profile_name</code> (or{" "}
+                      <code className="rounded bg-black/30 px-1 font-mono text-xs">profile_id</code> /{" "}
+                      <code className="rounded bg-black/30 px-1 font-mono text-xs">profile</code> /{" "}
+                      <code className="rounded bg-black/30 px-1 font-mono text-xs">id</code>). Those names become your{" "}
+                      <span className="text-foreground">X-Gemini-Profile</span> ids — no random ids.
+                    </p>
+                    <p className="font-mono text-xs leading-relaxed text-foreground/90">
+                      profile_name,__Secure-1PSIDTS,__Secure-1PSID,__Secure-3PSIDTS
+                    </p>
+                    <p>
+                      Optional column: <code className="font-mono text-xs">__Secure-3PSID</code>. If a profile already
+                      exists, its cookies are replaced. Ids must match letters, digits,{" "}
+                      <code className="font-mono text-xs">._-</code> (server rules).
+                    </p>
+                  </div>
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter className="gap-2 sm:gap-0">
+                <Button variant="outline" onClick={() => setImportOpen(false)} disabled={importing}>
+                  Cancel
+                </Button>
+                <Button
+                  disabled={importing || !getAdminKey()}
+                  onClick={() => csvFileInputRef.current?.click()}
+                >
+                  {importing ? "Importing…" : "Choose CSV file"}
+                </Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
