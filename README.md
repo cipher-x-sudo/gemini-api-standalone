@@ -10,6 +10,61 @@ This is **not** the official Google Generative AI SDK; it uses browser session c
 - Compose **creates** a bridge network named **`gemini-prismacreative-net`** automatically on first `up`.
 - **Docker + volume**: cookie data under `/data` (`gemini_data`).
 - **Control UI** at `/ui`.
+- **Persistent cookies**: background session refresh and disk writes — see [Persistent cookies and always-on sessions](#persistent-cookies-and-always-on-sessions) below.
+
+## Persistent cookies and always-on sessions
+
+**Persistent Cookies** — The service is designed for **always-on** operation: it passes **`auto_refresh`** into `gemini_webapi`’s `GeminiClient.init` so the upstream library can **rotate session cookies in the background** (notably `__Secure-1PSIDTS` while the account is still valid), and it **saves the cookie jar to disk** after `init` and after each upstream call under each profile’s `cookies.json` (see [`app/main.py`](app/main.py) and the **Layout on disk** section below).
+
+**This is not a full re-login or OAuth flow.** If Google invalidates the main session cookie (`__Secure-1PSID`) or the account is signed out, you must **re-paste cookies** from a logged-in browser (via `/ui` or `POST /admin/api/profiles/{id}/cookies`).
+
+### Upstream behavior (reference: `Gemini-API/` in this repo)
+
+The runtime dependency is **`gemini_webapi`** from PyPI ([`requirements.txt`](requirements.txt)). If you keep a copy of the library under **[`Gemini-API/`](Gemini-API/)**, it is the same family of code; use it to read exactly how “persistent cookies / background refresh” works:
+
+| Piece | Where in `Gemini-API/` |
+| ----- | ---------------------- |
+| **`init(auto_refresh=..., refresh_interval=...)`** — schedules the background loop when `auto_refresh` is true | [`src/gemini_webapi/client.py`](Gemini-API/src/gemini_webapi/client.py) (`GeminiClient.init`, `asyncio.create_task(self.start_auto_refresh())`) |
+| **Background loop** — sleeps `refresh_interval` (clamped to ≥ 60s), then calls rotation under a lock | [`start_auto_refresh`](Gemini-API/src/gemini_webapi/client.py) on `GeminiClient` |
+| **Rotation request** — `POST` to Google’s rotate endpoint, updates `__Secure-1PSIDTS`, writes cache file | [`rotate_1psidts`](Gemini-API/src/gemini_webapi/utils/rotate_1psidts.py) and `save_cookies` in the same module |
+| **Where files go** — directory from env `GEMINI_COOKIE_PATH` (this service sets it per profile to your `profiles/<id>/` dir before creating the client) | `_get_cookie_cache_dir` / `_get_cookies_cache_path` in [`rotate_1psidts.py`](Gemini-API/src/gemini_webapi/utils/rotate_1psidts.py) |
+| **Save on shutdown** | `GeminiClient.close` → `save_cookies` in the same [`client.py`](Gemini-API/src/gemini_webapi/client.py) |
+
+This standalone app wires **`GEMINI_AUTO_ROTATE`** / **`GEMINI_REFRESH_INTERVAL_SECONDS`** into that `init` path and additionally **exports the client jar to `cookies.json`** after operations ([`app/main.py`](app/main.py)) so your Docker volume stays the source of truth for `/v1/*`.
+
+### How to enable and tune
+
+| Action | What to do |
+| ------ | ---------- |
+| Keep background refresh **on** (default) | Set `GEMINI_AUTO_ROTATE=true` or `GEMINI_AUTO_REFRESH=true` in `.env` (Compose default is **true**). |
+| Set how often the library attempts refresh (seconds; min **60**) | `GEMINI_REFRESH_INTERVAL_SECONDS` (default **600**). |
+| Apply changes | **Restart** `gemini-api` so in-process `GeminiClient` instances are rebuilt (see the Environment table below). |
+
+`GET /health` and `GET /admin/api/server` expose **`autoRotate`** and **`refreshIntervalSeconds`** so you can confirm what the process is using.
+
+### Storage (sessions survive restarts)
+
+The `gemini-api` service mounts the **`gemini_data`** Docker volume at **`/data`**. Per-profile files live under `GEMINI_PROFILES_ROOT` (default **`/data/profiles`**, e.g. `profiles/<id>/cookies.json`). **Do not delete this volume** if you want sessions to survive container recreation.
+
+### First-time and ongoing use of `/v1/*`
+
+1. **Seed cookies per profile** once: use **`/ui`** or **`POST /admin/api/profiles/{id}/cookies`** (with `Authorization: Bearer <ADMIN_API_KEY>`). Without a valid `cookies.json` for a profile, `/v1/*` returns **400** (missing cookies), regardless of `GEMINI_AUTO_ROTATE`.
+2. **Match the profile** in API clients: send header **`X-Gemini-Profile: <id>`** (or set `GEMINI_V1_DEFAULT_PROFILE` / use `random` as documented in the **Nexus-compatible (`/v1`)** section).
+
+### Monitor session health (optional)
+
+- **Per profile, quick check:** `POST /v1/status` with the same `X-Gemini-Api-Key` (if required) and `X-Gemini-Profile` as your generate calls; JSON includes **`authenticated`** and upstream **`status`**.
+- **All profiles, admin scan:** `GET /admin/api/profiles/auth-status` with `Authorization: Bearer <ADMIN_API_KEY>`.
+
+Example (`GEMINI_API_CLIENT_KEY` and profile id must match your server):
+
+```bash
+curl -sS -X POST "$BASE/v1/status" \
+  -H "Content-Type: application/json" \
+  -H "X-Gemini-Profile: my-profile" \
+  -H "X-Gemini-Api-Key: $GEMINI_API_CLIENT_KEY" \
+  -d '{}'
+```
 
 ## Prerequisites
 
@@ -80,11 +135,7 @@ Start **this** `gemini-api-standalone` stack **once** so the network exists, the
 | `GEMINI_UPSTREAM_RETRY_MAX` | After a **retryable** upstream rate limit (`UsageLimitExceeded`, `TemporarilyBlocked`, HTTP **429** in mapped errors), retry up to this many **extra** attempts (default **0**). Retries **re-invoke** the same operation and may consume additional quota. |
 | `GEMINI_UPSTREAM_RETRY_BASE_MS` | Base delay in milliseconds for exponential backoff between retries (default **500**). |
 
-Restart the service after changing rotation settings so existing Gemini clients are recreated.
-
-### Auto-rotate (session cookies)
-
-The upstream client can run a background loop that refreshes Google session cookies (notably `__Secure-1PSIDTS`) so long-lived deployments stay authenticated. This service passes that through `GeminiClient.init(auto_refresh=…, refresh_interval=…)` and persists updated cookies under each profile’s `cookies.json`. Disable with `GEMINI_AUTO_ROTATE=false` if you prefer manual cookie updates only.
+Restart the service after changing rotation settings so existing Gemini clients are recreated. For a full description of auto-rotate, disk layout, and monitoring, see [Persistent cookies and always-on sessions](#persistent-cookies-and-always-on-sessions).
 
 ### Concurrency and blocking I/O
 
