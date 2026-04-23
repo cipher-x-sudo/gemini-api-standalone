@@ -187,11 +187,13 @@ export const api = {
   getLogs: (limit = 800) =>
     fetchWithAuth(`/admin/api/logs?limit=${encodeURIComponent(String(limit))}`) as Promise<LogsResponse>,
   getProfiles: () => fetchWithAuth("/admin/api/profiles"),
-  createProfile: (profileId: string) => 
+  createProfile: (profileId: string, cookies?: unknown) =>
     fetchWithAuth("/admin/api/profiles", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ profileId })
+      body: JSON.stringify(
+        cookies !== undefined && cookies !== null ? { profileId, cookies } : { profileId },
+      ),
     }),
   deleteProfile: (profileId: string) => 
     fetchWithAuth(`/admin/api/profiles/${profileId}`, { method: "DELETE" }),

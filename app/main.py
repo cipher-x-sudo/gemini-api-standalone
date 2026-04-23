@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app import state_store
 
@@ -1480,6 +1480,10 @@ class CookiesPayload(BaseModel):
 
 class CreateProfilePayload(BaseModel):
     profileId: str = Field(..., min_length=1, max_length=63)
+    cookies: Any | None = Field(
+        default=None,
+        description="Optional. Same JSON shapes as POST /admin/api/profiles/{id}/cookies.",
+    )
 
 
 @app.get("/admin/api/profiles/{profile_id}/cookies")
@@ -1516,7 +1520,23 @@ async def admin_create_profile(body: CreateProfilePayload, authorization: Option
     _check_admin(authorization)
     pid = _sanitize_profile_id(body.profileId.strip())
     profile_data_dir(pid)
-    return JSONResponse({"ok": True, "profile": pid})
+    if body.cookies is not None:
+        try:
+            pl = CookiesPayload.model_validate(body.cookies)
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid cookies: {e.errors()}") from e
+        ck = normalize_gemini_web_cookies_from_parsed(pl.cookies)
+        if not ck:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not normalize cookies (need __Secure-1PSID).",
+            )
+        await _run_sync_io(save_cookies_json_file, profile_data_dir(pid) / "cookies.json", ck)
+        try:
+            await state_store.clear_account_status(pid)
+        except Exception as e:
+            log.warning("clear_account_status profile=%s (create+ cookies): %s", pid, e)
+    return JSONResponse({"ok": True, "profile": pid, "cookiesSaved": body.cookies is not None})
 
 
 @app.delete("/admin/api/profiles/{profile_id}")

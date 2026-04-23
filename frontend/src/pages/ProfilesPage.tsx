@@ -23,6 +23,7 @@ export function ProfilesPage() {
   
   // Modals
   const [newProfileId, setNewProfileId] = useState("");
+  const [newProfileCookies, setNewProfileCookies] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [cookieOpen, setCookieOpen] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState("");
@@ -94,11 +95,32 @@ export function ProfilesPage() {
 
   const handleCreateProfile = async () => {
     if (!newProfileId) return;
+    const raw = newProfileCookies.trim();
+    let cookiesPayload: unknown | undefined;
+    if (raw) {
+      try {
+        cookiesPayload = JSON.parse(raw);
+      } catch {
+        toast({
+          title: "Invalid JSON",
+          description: "Fix the cookie JSON or clear the box to create the profile without cookies.",
+          variant: "destructive",
+        });
+        return;
+      }
+    }
     try {
-      await api.createProfile(newProfileId);
-      toast({ title: "Profile Created", description: `Profile ${newProfileId} has been created.` });
+      await api.createProfile(newProfileId, cookiesPayload);
+      toast({
+        title: "Profile Created",
+        description:
+          raw.length > 0
+            ? `Profile ${newProfileId} was created and cookies were saved.`
+            : `Profile ${newProfileId} has been created.`,
+      });
       setCreateOpen(false);
       setNewProfileId("");
+      setNewProfileCookies("");
       loadProfiles();
     } catch (e: any) {
       toast({ title: "Error", description: e.message, variant: "destructive" });
@@ -166,26 +188,52 @@ export function ProfilesPage() {
             <RefreshCw className={`mr-2 h-4 w-4 shrink-0 ${loading ? "animate-spin" : ""}`} />
             <span className="hidden sm:inline">Refresh</span>
           </Button>
-          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+          <Dialog
+            open={createOpen}
+            onOpenChange={(open) => {
+              setCreateOpen(open);
+              if (!open) {
+                setNewProfileId("");
+                setNewProfileCookies("");
+              }
+            }}
+          >
             <DialogTrigger asChild>
               <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-lg shadow-primary/20 transition-all hover:shadow-primary/40">
                 <Plus className="mr-2 h-4 w-4" />
                 New Profile
               </Button>
             </DialogTrigger>
-            <DialogContent className="sm:max-w-[425px]">
+            <DialogContent className="sm:max-w-[500px]">
               <DialogHeader>
                 <DialogTitle>Create Profile</DialogTitle>
                 <DialogDescription>
-                  Enter a unique identifier for the new profile. Use letters, digits, and dashes.
+                  Enter a unique profile id (letters, digits, <code className="text-xs">._-</code>). Optionally paste Gemini
+                  cookies in the same step.
                 </DialogDescription>
               </DialogHeader>
-              <div className="grid gap-4 py-4">
+              <div className="grid gap-4 py-2">
                 <div className="grid grid-cols-4 items-center gap-4">
                   <Label htmlFor="profileId" className="text-right">
                     Profile ID
                   </Label>
-                  <Input id="profileId" value={newProfileId} onChange={(e) => setNewProfileId(e.target.value)} placeholder="my-profile" className="col-span-3" />
+                  <Input
+                    id="profileId"
+                    value={newProfileId}
+                    onChange={(e) => setNewProfileId(e.target.value)}
+                    placeholder="my-profile"
+                    className="col-span-3"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="newProfileCookies">Cookies (optional)</Label>
+                  <textarea
+                    id="newProfileCookies"
+                    className="w-full h-40 bg-black/50 border border-border/50 rounded-md p-3 text-sm text-foreground font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+                    placeholder='[{"name": "__Secure-1PSID", "value": "…"}] or a flat object with __Secure-1PSID'
+                    value={newProfileCookies}
+                    onChange={(e) => setNewProfileCookies(e.target.value)}
+                  />
                 </div>
               </div>
               <DialogFooter>
