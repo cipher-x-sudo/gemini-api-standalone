@@ -1719,16 +1719,15 @@ async def admin_import_profiles_csv(
     skipped = 0
     for cur, (line_no, label, cookies_flat) in enumerate(rows, start=1):
         if len(label) > _MAX_PROFILE_LABEL_LEN:
-            skipped += 1
-            failures.append(f"Line {line_no}: label exceeds {_MAX_PROFILE_LABEL_LEN} characters.")
-            log.warning(
-                "CSV import %s/%s csv_line=%s skip label_too_long chars=%s",
+            log.info(
+                "CSV import %s/%s csv_line=%s label_truncated from_chars=%s to_max=%s",
                 cur,
                 total_rows,
                 line_no,
                 len(label),
+                _MAX_PROFILE_LABEL_LEN,
             )
-            continue
+            label = label[:_MAX_PROFILE_LABEL_LEN]
         ck = normalize_gemini_web_cookies_from_parsed(cookies_flat)
         if not ck:
             skipped += 1
