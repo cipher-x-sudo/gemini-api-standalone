@@ -1,7 +1,7 @@
-/** Matches server `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$` in app/main.py */
-export const PROFILE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/;
+/** Server allows label/email up to 320 chars (CreateProfilePayload). */
+export const MAX_PROFILE_LABEL_LENGTH = 320;
 
-const PROFILE_HEADER_ALIASES = new Set(["profile_name", "profile_id", "profile", "id"]);
+const PROFILE_NAME_HEADER_ALIASES = new Set(["profile_name", "profile_id", "profile", "id"]);
 
 const COOKIE_HEADERS = [
   "__Secure-1PSIDTS",
@@ -12,7 +12,8 @@ const COOKIE_HEADERS = [
 
 export type CsvProfileRow = {
   lineNumber: number;
-  profileId: string;
+  /** Value from `profile_name` (or alias column) — stored as Label / email; not the API profile id. */
+  profileLabel: string;
   cookies: Record<string, string>;
 };
 
@@ -63,8 +64,8 @@ export type ParsedProfilesCsv =
   | { ok: false; error: string };
 
 /**
- * Expects a header row. Required: a profile column (`profile_name`, `profile_id`, `profile`, or `id`)
- * and `__Secure-1PSID`. Optional: `__Secure-1PSIDTS`, `__Secure-3PSIDTS`, `__Secure-3PSID`.
+ * Expects a header row. Required: a name column (`profile_name`, `profile_id`, `profile`, or `id`)
+ * and `__Secure-1PSID` (or `__Secure-3PSID`). Optional: `__Secure-1PSIDTS`, `__Secure-3PSIDTS`.
  */
 export function parseProfilesCookiesCsv(text: string): ParsedProfilesCsv {
   const raw = stripBom(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
@@ -75,17 +76,17 @@ export function parseProfilesCookiesCsv(text: string): ParsedProfilesCsv {
   const headerCells = parseCsvLine(lines[0]).map(normalizeHeader);
   const lower = headerCells.map((h) => h.toLowerCase());
 
-  let profileCol = -1;
+  let nameCol = -1;
   for (let i = 0; i < lower.length; i++) {
-    if (PROFILE_HEADER_ALIASES.has(lower[i])) {
-      profileCol = i;
+    if (PROFILE_NAME_HEADER_ALIASES.has(lower[i])) {
+      nameCol = i;
       break;
     }
   }
-  if (profileCol < 0) {
+  if (nameCol < 0) {
     return {
       ok: false,
-      error: `Missing profile column. Use one of: ${[...PROFILE_HEADER_ALIASES].join(", ")}.`,
+      error: `Missing name column. Use one of: ${[...PROFILE_NAME_HEADER_ALIASES].join(", ")}.`,
     };
   }
 
@@ -107,8 +108,8 @@ export function parseProfilesCookiesCsv(text: string): ParsedProfilesCsv {
   for (let li = 1; li < lines.length; li++) {
     const lineNumber = li + 1;
     const cells = parseCsvLine(lines[li]).map((c) => c.trim());
-    const profileId = (cells[profileCol] ?? "").trim();
-    if (!profileId) {
+    const profileLabel = (cells[nameCol] ?? "").trim();
+    if (!profileLabel) {
       continue;
     }
     const cookies: Record<string, string> = {};
@@ -122,22 +123,22 @@ export function parseProfilesCookiesCsv(text: string): ParsedProfilesCsv {
         cookies[name] = v;
       }
     }
-    rows.push({ lineNumber, profileId, cookies });
+    rows.push({ lineNumber, profileLabel, cookies });
   }
 
   if (!rows.length) {
-    return { ok: false, error: "No data rows with a non-empty profile id." };
+    return { ok: false, error: "No data rows with a non-empty profile_name (label) cell." };
   }
   return { ok: true, rows };
 }
 
-export function validateProfileId(id: string): string | null {
-  const t = id.trim();
+export function validateProfileLabel(label: string): string | null {
+  const t = label.trim();
   if (!t) {
-    return "Empty profile id";
+    return "Empty label";
   }
-  if (!PROFILE_ID_PATTERN.test(t)) {
-    return "Invalid profile id (use letters, digits, ._- only; max 63 chars after first character).";
+  if (t.length > MAX_PROFILE_LABEL_LENGTH) {
+    return `Label exceeds ${MAX_PROFILE_LABEL_LENGTH} characters (server limit).`;
   }
   return null;
 }

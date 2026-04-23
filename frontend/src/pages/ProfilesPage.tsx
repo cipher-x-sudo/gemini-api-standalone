@@ -11,7 +11,7 @@ import { api, getAdminKey } from "@/lib/api";
 import {
   parseProfilesCookiesCsv,
   rowHasPsidCookie,
-  validateProfileId,
+  validateProfileLabel,
 } from "@/lib/csvProfiles";
 
 type ProfileDetails = {
@@ -204,9 +204,6 @@ export function ProfilesPage() {
     }
   };
 
-  const isProfileAlreadyExistsError = (msg: string) =>
-    /\b409\b/i.test(msg) || /already exists/i.test(msg);
-
   const handleCsvFileSelected = async (file: File | null) => {
     if (!file) {
       return;
@@ -219,14 +216,13 @@ export function ProfilesPage() {
     }
     setImporting(true);
     let created = 0;
-    let updated = 0;
     let skipped = 0;
     const failures: string[] = [];
     for (const row of parsed.rows) {
-      const idErr = validateProfileId(row.profileId);
-      if (idErr) {
+      const labelErr = validateProfileLabel(row.profileLabel);
+      if (labelErr) {
         skipped++;
-        failures.push(`Line ${row.lineNumber}: ${idErr}`);
+        failures.push(`Line ${row.lineNumber}: ${labelErr}`);
         continue;
       }
       if (!rowHasPsidCookie(row.cookies)) {
@@ -234,30 +230,17 @@ export function ProfilesPage() {
         failures.push(`Line ${row.lineNumber}: missing __Secure-1PSID / __Secure-3PSID`);
         continue;
       }
-      const pid = row.profileId.trim();
       try {
         await api.createProfile({
-          profileId: pid,
-          email: null,
+          profileId: null,
+          email: row.profileLabel.trim(),
           cookies: row.cookies,
         });
         created++;
       } catch (e: unknown) {
+        skipped++;
         const msg = e instanceof Error ? e.message : String(e);
-        if (isProfileAlreadyExistsError(msg)) {
-          try {
-            await api.setCookies(pid, row.cookies);
-            updated++;
-          } catch (e2: unknown) {
-            skipped++;
-            failures.push(
-              `Line ${row.lineNumber} (${pid}): ${e2 instanceof Error ? e2.message : String(e2)}`,
-            );
-          }
-        } else {
-          skipped++;
-          failures.push(`Line ${row.lineNumber} (${pid}): ${msg}`);
-        }
+        failures.push(`Line ${row.lineNumber} (${row.profileLabel}): ${msg}`);
       }
     }
     setImporting(false);
@@ -266,16 +249,15 @@ export function ProfilesPage() {
       csvFileInputRef.current.value = "";
     }
     await loadProfiles();
-    const okTotal = created + updated;
     toast({
       title: "CSV import finished",
       description:
-        `${okTotal} profile(s) saved (${created} new, ${updated} updated).` +
+        `${created} profile(s) created with random ids; profile_name → Label / email.` +
         (skipped ? ` ${skipped} skipped.` : "") +
         (failures.length
           ? ` First issues: ${failures.slice(0, 3).join(" · ")}${failures.length > 3 ? " …" : ""}`
           : ""),
-      variant: failures.length && okTotal === 0 ? "destructive" : "default",
+      variant: failures.length && created === 0 ? "destructive" : "default",
     });
   };
 
@@ -428,20 +410,21 @@ export function ProfilesPage() {
                 <DialogDescription asChild>
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      First row must be headers. Profile id comes from{" "}
+                      First row must be headers.{" "}
                       <code className="rounded bg-black/30 px-1 font-mono text-xs">profile_name</code> (or{" "}
                       <code className="rounded bg-black/30 px-1 font-mono text-xs">profile_id</code> /{" "}
                       <code className="rounded bg-black/30 px-1 font-mono text-xs">profile</code> /{" "}
-                      <code className="rounded bg-black/30 px-1 font-mono text-xs">id</code>). Those names become your{" "}
-                      <span className="text-foreground">X-Gemini-Profile</span> ids — no random ids.
+                      <code className="rounded bg-black/30 px-1 font-mono text-xs">id</code>) is saved as{" "}
+                      <span className="text-foreground">Label / email</span> (e.g. your Gmail). Each row gets a{" "}
+                      <span className="text-foreground">new random Profile ID</span> (same as &quot;New Profile&quot;
+                      without a custom id) — use that id in <code className="font-mono text-xs">X-Gemini-Profile</code>.
                     </p>
                     <p className="font-mono text-xs leading-relaxed text-foreground/90">
                       profile_name,__Secure-1PSIDTS,__Secure-1PSID,__Secure-3PSIDTS
                     </p>
                     <p>
-                      Optional column: <code className="font-mono text-xs">__Secure-3PSID</code>. If a profile already
-                      exists, its cookies are replaced. Ids must match letters, digits,{" "}
-                      <code className="font-mono text-xs">._-</code> (server rules).
+                      Optional column: <code className="font-mono text-xs">__Secure-3PSID</code>. Re-importing the same
+                      file creates additional profiles (it does not match rows to existing ids).
                     </p>
                   </div>
                 </DialogDescription>
