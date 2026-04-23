@@ -8,11 +8,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { api, getAdminKey } from "@/lib/api";
-import {
-  parseProfilesCookiesCsv,
-  rowHasPsidCookie,
-  validateProfileLabel,
-} from "@/lib/csvProfiles";
 
 type ProfileDetails = {
   id: string;
@@ -41,6 +36,10 @@ export function ProfilesPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [importing, setImporting] = useState(false);
   const csvFileInputRef = useRef<HTMLInputElement>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const selectAllCheckboxRef = useRef<HTMLInputElement>(null);
+
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
   const filteredProfiles = useMemo(() => {
     const q = profileSearch.trim().toLowerCase();
@@ -55,6 +54,16 @@ export function ProfilesPage() {
       return email.includes(q);
     });
   }, [profiles, profileSearch]);
+
+  useEffect(() => {
+    const el = selectAllCheckboxRef.current;
+    if (!el) {
+      return;
+    }
+    const ids = filteredProfiles.map((p) => p.id);
+    const n = ids.filter((id) => selectedSet.has(id)).length;
+    el.indeterminate = n > 0 && n < ids.length;
+  }, [filteredProfiles, selectedSet]);
 
   const loadProfiles = async (opts?: { probeLiveAuth?: boolean }) => {
     if (!getAdminKey()) {
@@ -99,6 +108,8 @@ export function ProfilesPage() {
         })
       );
       setProfiles(details);
+      const validIds = new Set(details.map((p) => p.id));
+      setSelectedIds((prev) => prev.filter((id) => validIds.has(id)));
     } catch (e: any) {
       toast({ title: "Error loading profiles", description: e.message, variant: "destructive" });
       setProfiles([]);
@@ -172,6 +183,7 @@ export function ProfilesPage() {
     try {
       await api.deleteProfile(id);
       toast({ title: "Profile Deleted", description: `Profile ${id} was removed.` });
+      setSelectedIds((prev) => prev.filter((x) => x !== id));
       loadProfiles();
     } catch (e: any) {
       toast({ title: "Error", description: e.message, variant: "destructive" });
@@ -208,57 +220,113 @@ export function ProfilesPage() {
     if (!file) {
       return;
     }
-    const text = await file.text();
-    const parsed = parseProfilesCookiesCsv(text);
-    if (!parsed.ok) {
-      toast({ title: "Invalid CSV", description: parsed.error, variant: "destructive" });
+    setImporting(true);
+    try {
+      const res = await api.importProfilesCsv(file);
+      const created = res.createdCount ?? 0;
+      const skipped = res.skipped ?? 0;
+      const failures = res.failures ?? [];
+      const stored = res.storedFile ?? "";
+      toast({
+        title: "CSV import finished",
+        description:
+          `${created} profile(s) created on the server.` +
+          (stored ? ` Saved upload: ${stored}.` : "") +
+          (skipped ? ` ${skipped} row(s) skipped.` : "") +
+          (failures.length
+            ? ` Issues: ${failures.slice(0, 3).join(" · ")}${failures.length > 3 ? " …" : ""}`
+            : "") +
+          " Use Refresh (auth) to probe sessions when ready.",
+        variant: failures.length && created === 0 ? "destructive" : "default",
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast({ title: "CSV import failed", description: msg, variant: "destructive" });
+    } finally {
+      setImporting(false);
+      setImportOpen(false);
+      if (csvFileInputRef.current) {
+        csvFileInputRef.current.value = "";
+      }
+      await loadProfiles();
+    }
+  };
+
+  const filteredIds = useMemo(() => filteredProfiles.map((p) => p.id), [filteredProfiles]);
+
+  const allFilteredSelected =
+    filteredIds.length > 0 && filteredIds.every((id) => selectedSet.has(id));
+
+  const toggleSelectAllFiltered = () => {
+    if (filteredIds.length === 0) {
       return;
     }
-    setImporting(true);
-    let created = 0;
-    let skipped = 0;
-    const failures: string[] = [];
-    for (const row of parsed.rows) {
-      const labelErr = validateProfileLabel(row.profileLabel);
-      if (labelErr) {
-        skipped++;
-        failures.push(`Line ${row.lineNumber}: ${labelErr}`);
-        continue;
-      }
-      if (!rowHasPsidCookie(row.cookies)) {
-        skipped++;
-        failures.push(`Line ${row.lineNumber}: missing __Secure-1PSID / __Secure-3PSID`);
-        continue;
-      }
-      try {
-        await api.createProfile({
-          profileId: null,
-          email: row.profileLabel.trim(),
-          cookies: row.cookies,
-        });
-        created++;
-      } catch (e: unknown) {
-        skipped++;
-        const msg = e instanceof Error ? e.message : String(e);
-        failures.push(`Line ${row.lineNumber} (${row.profileLabel}): ${msg}`);
-      }
+    if (allFilteredSelected) {
+      setSelectedIds((prev) => prev.filter((id) => !filteredIds.includes(id)));
+    } else {
+      setSelectedIds((prev) => [...new Set([...prev, ...filteredIds])]);
     }
-    setImporting(false);
-    setImportOpen(false);
-    if (csvFileInputRef.current) {
-      csvFileInputRef.current.value = "";
+  };
+
+  const toggleRowSelected = (id: string) => {
+    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const handleBulkDeleteSelected = async () => {
+    if (selectedIds.length === 0) {
+      return;
     }
-    await loadProfiles();
-    toast({
-      title: "CSV import finished",
-      description:
-        `${created} profile(s) created with random ids; profile_name → Label / email.` +
-        (skipped ? ` ${skipped} skipped.` : "") +
-        (failures.length
-          ? ` First issues: ${failures.slice(0, 3).join(" · ")}${failures.length > 3 ? " …" : ""}`
-          : ""),
-      variant: failures.length && created === 0 ? "destructive" : "default",
-    });
+    if (
+      !window.confirm(
+        `Delete ${selectedIds.length} selected profile(s)? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await api.bulkDeleteProfiles({ profileIds: selectedIds });
+      const n = res.deleted?.length ?? 0;
+      const errN = res.errors?.length ?? 0;
+      toast({
+        title: "Bulk delete finished",
+        description: `${n} deleted.${errN ? ` ${errN} error(s).` : ""}`,
+        variant: errN ? "destructive" : "default",
+      });
+      setSelectedIds([]);
+      await loadProfiles();
+    } catch (e: unknown) {
+      toast({
+        title: "Bulk delete failed",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleBulkDeleteAll = async () => {
+    if (profiles.length === 0) {
+      return;
+    }
+    if (
+      !window.confirm(
+        `Delete ALL ${profiles.length} profile(s) on this server? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await api.bulkDeleteProfiles({ all: true });
+      const n = res.deleted?.length ?? 0;
+      toast({ title: "All profiles deleted", description: `${n} profile(s) removed.` });
+      setSelectedIds([]);
+      await loadProfiles();
+    } catch (e: unknown) {
+      toast({
+        title: "Delete all failed",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    }
   };
 
   const handleCheckStatus = async (id: string) => {
@@ -304,6 +372,30 @@ export function ProfilesPage() {
             <Upload className="mr-2 h-4 w-4 shrink-0" />
             <span className="hidden sm:inline">Import CSV</span>
             <span className="sm:hidden">CSV</span>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="border-destructive/40 text-destructive hover:bg-destructive/10"
+            disabled={loading || !getAdminKey() || selectedIds.length === 0}
+            onClick={() => void handleBulkDeleteSelected()}
+            title="Delete selected profiles"
+          >
+            <Trash2 className="mr-2 h-4 w-4 shrink-0" />
+            <span className="hidden sm:inline">Delete selected</span>
+            <span className="sm:hidden">Sel</span>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="border-destructive/40 text-destructive hover:bg-destructive/10"
+            disabled={loading || !getAdminKey() || profiles.length === 0}
+            onClick={() => void handleBulkDeleteAll()}
+            title="Delete every profile on this server"
+          >
+            <Trash2 className="mr-2 h-4 w-4 shrink-0" />
+            <span className="hidden sm:inline">Delete all</span>
+            <span className="sm:hidden">All</span>
           </Button>
           <Button
             variant="outline"
@@ -410,21 +502,23 @@ export function ProfilesPage() {
                 <DialogDescription asChild>
                   <div className="space-y-3 text-sm text-muted-foreground">
                     <p>
-                      First row must be headers.{" "}
+                      The file is uploaded to the server (saved under{" "}
+                      <code className="font-mono text-xs">profiles/_csv_uploads/</code>), then each row creates a
+                      profile.{" "}
                       <code className="rounded bg-black/30 px-1 font-mono text-xs">profile_name</code> (or{" "}
                       <code className="rounded bg-black/30 px-1 font-mono text-xs">profile_id</code> /{" "}
                       <code className="rounded bg-black/30 px-1 font-mono text-xs">profile</code> /{" "}
-                      <code className="rounded bg-black/30 px-1 font-mono text-xs">id</code>) is saved as{" "}
-                      <span className="text-foreground">Label / email</span> (e.g. your Gmail). Each row gets a{" "}
-                      <span className="text-foreground">new random Profile ID</span> (same as &quot;New Profile&quot;
-                      without a custom id) — use that id in <code className="font-mono text-xs">X-Gemini-Profile</code>.
+                      <code className="rounded bg-black/30 px-1 font-mono text-xs">id</code>) becomes{" "}
+                      <span className="text-foreground">Label / email</span>. Each row gets a{" "}
+                      <span className="text-foreground">random Profile ID</span> for{" "}
+                      <code className="font-mono text-xs">X-Gemini-Profile</code>. Auth probe is skipped during import —
+                      use Refresh when done.
                     </p>
                     <p className="font-mono text-xs leading-relaxed text-foreground/90">
-                      profile_name,__Secure-1PSIDTS,__Secure-1PSID,__Secure-3PSIDTS
+                      profile_name,__Secure-1PSIDTS,__Secure-1PSID,__Secure-3PSID,__Secure-3PSIDTS
                     </p>
                     <p>
-                      Optional column: <code className="font-mono text-xs">__Secure-3PSID</code>. Re-importing the same
-                      file creates additional profiles (it does not match rows to existing ids).
+                      Re-importing creates more profiles (rows are not merged with existing accounts).
                     </p>
                   </div>
                 </DialogDescription>
@@ -470,7 +564,18 @@ export function ProfilesPage() {
           <Table>
             <TableHeader className="bg-white/[0.02]">
               <TableRow className="border-border/50 hover:bg-transparent">
-                <TableHead className="w-[min(14rem,28vw)] pl-6">Profile ID</TableHead>
+                <TableHead className="w-10 pl-4">
+                  <input
+                    ref={selectAllCheckboxRef}
+                    type="checkbox"
+                    checked={allFilteredSelected}
+                    onChange={toggleSelectAllFiltered}
+                    disabled={loading || filteredProfiles.length === 0}
+                    className="rounded border-border"
+                    aria-label="Select all profiles in this list"
+                  />
+                </TableHead>
+                <TableHead className="w-[min(14rem,28vw)] pl-2">Profile ID</TableHead>
                 <TableHead className="min-w-[10rem]">Label / email</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Cookies</TableHead>
@@ -481,14 +586,14 @@ export function ProfilesPage() {
             <TableBody>
               {profiles.length === 0 && !loading && (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center py-8 text-muted-foreground">
+                  <TableCell colSpan={7} className="text-center py-8 text-muted-foreground">
                     No profiles found or invalid API key. Try setting your Admin API Key in the Settings menu.
                   </TableCell>
                 </TableRow>
               )}
               {profiles.length > 0 && filteredProfiles.length === 0 && !loading && (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center py-8 text-muted-foreground">
+                  <TableCell colSpan={7} className="text-center py-8 text-muted-foreground">
                     No profiles match &quot;{profileSearch.trim()}&quot;. Try another email or id fragment.
                   </TableCell>
                 </TableRow>
@@ -504,7 +609,16 @@ export function ProfilesPage() {
                 const isAuthenticated = Boolean(profile.status) && !failedAuth && !uncertain;
                 return (
                 <TableRow key={profile.id} className="border-border/50 hover:bg-white/[0.04] transition-colors group">
-                  <TableCell className="font-mono text-xs pl-6 max-w-[14rem] truncate" title={profile.id}>
+                  <TableCell className="w-10 pl-4">
+                    <input
+                      type="checkbox"
+                      checked={selectedSet.has(profile.id)}
+                      onChange={() => toggleRowSelected(profile.id)}
+                      className="rounded border-border"
+                      aria-label={`Select profile ${profile.id}`}
+                    />
+                  </TableCell>
+                  <TableCell className="font-mono text-xs pl-2 max-w-[14rem] truncate" title={profile.id}>
                     {profile.id}
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground max-w-[12rem] truncate" title={profile.email || undefined}>

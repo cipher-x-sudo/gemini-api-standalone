@@ -183,6 +183,48 @@ export type AdminGenerationsResponse = {
   redis: { configured: boolean; connected: boolean };
 };
 
+export type ImportCsvResponse = {
+  ok?: boolean;
+  storedFile?: string;
+  createdCount?: number;
+  skipped?: number;
+  profiles?: string[];
+  failures?: string[];
+};
+
+export type BulkDeleteProfilesResponse = {
+  ok?: boolean;
+  deleted?: string[];
+  errors?: { profile: string; detail: string }[];
+};
+
+async function fetchMultipartWithAuth(url: string, formData: FormData) {
+  const key = getAdminKey();
+  const headers = new Headers();
+  if (key) {
+    headers.set("Authorization", `Bearer ${key}`);
+  }
+  const response = await fetch(`${API_BASE}${url}`, {
+    method: "POST",
+    headers,
+    body: formData,
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => null);
+    const detail = errorData?.detail;
+    const msg =
+      typeof detail === "string"
+        ? detail
+        : Array.isArray(detail)
+          ? JSON.stringify(detail)
+          : detail
+            ? JSON.stringify(detail)
+            : `HTTP Error ${response.status}`;
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
 export const api = {
   getLogs: (limit = 800) =>
     fetchWithAuth(`/admin/api/logs?limit=${encodeURIComponent(String(limit))}`) as Promise<LogsResponse>,
@@ -224,8 +266,21 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: email && email.trim() ? email.trim() : null }),
     }),
-  deleteProfile: (profileId: string) => 
-    fetchWithAuth(`/admin/api/profiles/${profileId}`, { method: "DELETE" }),
+  deleteProfile: (profileId: string) =>
+    fetchWithAuth(`/admin/api/profiles/${encodeURIComponent(profileId)}`, { method: "DELETE" }),
+  /** Upload CSV; server saves file under profiles/_csv_uploads/ and creates one profile per row. */
+  importProfilesCsv: (file: File) =>
+    fetchMultipartWithAuth("/admin/api/profiles/import-csv", (() => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return fd;
+    })()) as Promise<ImportCsvResponse>,
+  bulkDeleteProfiles: (body: { all?: boolean; profileIds?: string[] }) =>
+    fetchWithAuth("/admin/api/profiles/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }) as Promise<BulkDeleteProfilesResponse>,
   /** Live Gemini session probe for every profile (can take minutes). Persists last account status per profile. */
   getProfilesAuthStatus: () => fetchWithAuth("/admin/api/profiles/auth-status"),
   getCookies: (profileId: string) => 

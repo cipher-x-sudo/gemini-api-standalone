@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import enum
+import io
 import json
 import logging
 import mimetypes
@@ -38,7 +40,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -1552,6 +1554,262 @@ class ProfileLabelPayload(BaseModel):
     email: str | None = Field(default=None, max_length=320)
 
 
+_MAX_PROFILE_LABEL_LEN = 320
+_CSV_UPLOAD_SUBDIR = "_csv_uploads"
+_PROFILE_CSV_NAME_HEADERS = frozenset({"profile_name", "profile_id", "profile", "id"})
+_PROFILE_CSV_COOKIE_NAMES = (
+    "__Secure-1PSIDTS",
+    "__Secure-1PSID",
+    "__Secure-3PSIDTS",
+    "__Secure-3PSID",
+)
+
+
+def _csv_upload_root() -> Path:
+    return (PROFILES_ROOT / _CSV_UPLOAD_SUBDIR).resolve()
+
+
+def _safe_stored_csv_filename(original: str) -> str:
+    base = Path(original).name[:120] or "upload.csv"
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", base).strip("._") or "upload"
+    if not safe.lower().endswith(".csv"):
+        safe += ".csv"
+    return safe[:180]
+
+
+def _csv_cell(row: list[str], i: int) -> str:
+    if i < len(row):
+        return row[i].strip()
+    return ""
+
+
+def _parse_profiles_import_csv(text: str) -> tuple[list[tuple[int, str, dict[str, str]]], Optional[str]]:
+    """
+    Parse UTF-8 CSV (same column rules as the UI). Returns (list of (line_no, label, flat_cookie_map), fatal_error).
+    line_no is 1-based file line index (header is line 1).
+    """
+    if not (text or "").strip():
+        return [], "Empty file"
+    f = io.StringIO(text)
+    reader = csv.reader(f)
+    try:
+        header_row = next(reader)
+    except StopIteration:
+        return [], "Empty CSV"
+    header_cells: list[str] = []
+    for i, h in enumerate(header_row):
+        c = h.strip()
+        if i == 0 and c.startswith("\ufeff"):
+            c = c[1:].strip()
+        header_cells.append(c)
+    lower = [h.lower() for h in header_cells]
+    name_col = -1
+    for idx, h in enumerate(lower):
+        if h in _PROFILE_CSV_NAME_HEADERS:
+            name_col = idx
+            break
+    if name_col < 0:
+        return [], f"Missing profile name column (one of: {', '.join(sorted(_PROFILE_CSV_NAME_HEADERS))})."
+    cookie_idx: dict[str, int] = {}
+    for cn in _PROFILE_CSV_COOKIE_NAMES:
+        try:
+            cookie_idx[cn] = header_cells.index(cn)
+        except ValueError:
+            pass
+    if "__Secure-1PSID" not in cookie_idx and "__Secure-3PSID" not in cookie_idx:
+        return [], "Missing cookie column __Secure-1PSID or __Secure-3PSID."
+    rows: list[tuple[int, str, dict[str, str]]] = []
+    line_no = 1
+    for data_cells in reader:
+        line_no += 1
+        label = _csv_cell(data_cells, name_col)
+        if not label:
+            continue
+        cookies: dict[str, str] = {}
+        for cn, ci in cookie_idx.items():
+            v = _csv_cell(data_cells, ci)
+            if v:
+                cookies[cn] = v
+        rows.append((line_no, label, cookies))
+    return rows, None
+
+
+class BulkDeleteProfilesPayload(BaseModel):
+    """Set all=true to delete every profile directory, or pass profileIds to delete a subset."""
+
+    all: bool = False
+    profileIds: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_mode(self) -> "BulkDeleteProfilesPayload":
+        if self.all:
+            return self
+        if self.profileIds:
+            return self
+        raise ValueError("Set all=true or provide a non-empty profileIds array.")
+
+
+async def _admin_delete_one_profile_by_pid(pid: str) -> None:
+    """Remove profile directory and cached Gemini client; pid must already be sanitized."""
+    if pid in _singleton_clients:
+        c = _singleton_clients.pop(pid)
+        await _maybe_await_close(c)
+    _singleton_ids.pop(pid, None)
+    await state_store.clear_account_status(pid)
+    d = PROFILES_ROOT / pid
+    if d.is_dir():
+        await _run_sync_io(shutil.rmtree, str(d), True)
+
+
+@app.post("/admin/api/profiles/import-csv")
+async def admin_import_profiles_csv(
+    authorization: Optional[str] = Header(None),
+    file: UploadFile = File(..., description="UTF-8 CSV; profile_name column → label/email; random profile id per row."),
+) -> JSONResponse:
+    """
+    Store the uploaded file under profiles/_csv_uploads/ and create one profile per data row
+    (auto id + label + cookies). Skips per-row Gemini auth probe for speed; use GET …/auth-status after.
+    """
+    _check_admin(authorization)
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+    if len(raw) > 32 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="CSV file too large (max 32 MiB).")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise HTTPException(status_code=400, detail="File must be UTF-8.") from e
+
+    rows, fatal = _parse_profiles_import_csv(text)
+    if fatal:
+        raise HTTPException(status_code=400, detail=fatal)
+    total_rows = len(rows)
+    log.info(
+        "CSV import begin total_rows=%s original_filename=%r",
+        total_rows,
+        file.filename or "",
+    )
+
+    dest_root = _csv_upload_root()
+    await _run_sync_io(partial(dest_root.mkdir, parents=True, exist_ok=True))
+    try:
+        dest_root.chmod(0o700)
+    except OSError:
+        pass
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stored_name = f"{stamp}_{uuid.uuid4().hex[:10]}_{_safe_stored_csv_filename(file.filename or 'upload.csv')}"
+    stored_path = (dest_root / stored_name).resolve()
+    if not str(stored_path).startswith(str(dest_root)):
+        raise HTTPException(status_code=400, detail="Invalid stored path.")
+    await _run_sync_io(partial(stored_path.write_text, text, encoding="utf-8"))
+    try:
+        stored_path.chmod(0o600)
+    except OSError:
+        pass
+
+    try:
+        stored_rel = str(stored_path.relative_to(PROFILES_ROOT.resolve()))
+    except ValueError:
+        stored_rel = stored_name
+    log.info("CSV import file stored path=%s total_rows=%s", stored_rel, total_rows)
+
+    created: list[str] = []
+    failures: list[str] = []
+    skipped = 0
+    for cur, (line_no, label, cookies_flat) in enumerate(rows, start=1):
+        if len(label) > _MAX_PROFILE_LABEL_LEN:
+            skipped += 1
+            failures.append(f"Line {line_no}: label exceeds {_MAX_PROFILE_LABEL_LEN} characters.")
+            log.warning(
+                "CSV import %s/%s csv_line=%s skip label_too_long chars=%s",
+                cur,
+                total_rows,
+                line_no,
+                len(label),
+            )
+            continue
+        ck = normalize_gemini_web_cookies_from_parsed(cookies_flat)
+        if not ck:
+            skipped += 1
+            failures.append(f"Line {line_no}: missing or invalid __Secure-1PSID / __Secure-3PSID.")
+            log.warning("CSV import %s/%s csv_line=%s skip invalid_cookies", cur, total_rows, line_no)
+            continue
+        try:
+            pid = _generate_unique_profile_id()
+            profile_data_dir(pid)
+            await _run_sync_io(save_profile_meta_file, _profile_meta_path(pid), label)
+            await _run_sync_io(save_cookies_json_file, profile_data_dir(pid) / "cookies.json", ck)
+            try:
+                await state_store.clear_account_status(pid)
+            except Exception as e:
+                log.warning("clear_account_status profile=%s (csv import): %s", pid, e)
+            created.append(pid)
+            log.info("CSV import %s/%s csv_line=%s ok profile=%s", cur, total_rows, line_no, pid)
+        except Exception as e:
+            skipped += 1
+            failures.append(f"Line {line_no} ({label!r}): {e}")
+            log.warning(
+                "CSV import %s/%s csv_line=%s failed: %s",
+                cur,
+                total_rows,
+                line_no,
+                e,
+            )
+
+    log.info(
+        "CSV import complete total_rows=%s created=%s skipped=%s stored=%s",
+        total_rows,
+        len(created),
+        skipped,
+        stored_rel,
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "storedFile": stored_rel,
+            "createdCount": len(created),
+            "skipped": skipped,
+            "profiles": created,
+            "failures": failures[:200],
+        }
+    )
+
+
+@app.post("/admin/api/profiles/bulk-delete")
+async def admin_bulk_delete_profiles(
+    body: BulkDeleteProfilesPayload, authorization: Optional[str] = Header(None)
+) -> JSONResponse:
+    _check_admin(authorization)
+    targets: list[str]
+    if body.all:
+        targets = list_all_profile_ids_on_disk()
+    else:
+        targets = []
+        for raw in body.profileIds:
+            t = (raw or "").strip()
+            if not t:
+                continue
+            if not _PROFILE_ID_RE.match(t):
+                continue
+            targets.append(t)
+        targets = sorted(set(targets))
+        if not targets:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid profile ids in profileIds (ids must match server profile id rules).",
+            )
+    deleted: list[str] = []
+    errors: list[dict[str, str]] = []
+    for pid in targets:
+        try:
+            await _admin_delete_one_profile_by_pid(pid)
+            deleted.append(pid)
+        except Exception as e:
+            errors.append({"profile": pid, "detail": str(e)})
+    return JSONResponse({"ok": True, "deleted": deleted, "errors": errors})
+
+
 @app.get("/admin/api/profiles/{profile_id}/cookies")
 async def admin_get_cookies(profile_id: str, authorization: Optional[str] = Header(None)) -> dict[str, Any]:
     _check_admin(authorization)
@@ -1716,14 +1974,7 @@ async def admin_create_profile(body: CreateProfilePayload, authorization: Option
 async def admin_delete_profile(profile_id: str, authorization: Optional[str] = Header(None)) -> JSONResponse:
     _check_admin(authorization)
     pid = _sanitize_profile_id(profile_id)
-    if pid in _singleton_clients:
-        c = _singleton_clients.pop(pid)
-        await _maybe_await_close(c)
-    _singleton_ids.pop(pid, None)
-    await state_store.clear_account_status(pid)
-    d = PROFILES_ROOT / pid
-    if d.is_dir():
-        shutil.rmtree(d, ignore_errors=True)
+    await _admin_delete_one_profile_by_pid(pid)
     return JSONResponse({"ok": True, "deleted": pid})
 
 
@@ -1767,8 +2018,10 @@ async def admin_list_profiles(authorization: Optional[str] = Header(None)) -> di
     _check_admin(authorization)
     if not PROFILES_ROOT.is_dir():
         return {"profiles": []}
-    names = sorted([p.name for p in PROFILES_ROOT.iterdir() if p.is_dir()])
-    return {"profiles": names}
+    names = sorted(
+        p.name for p in PROFILES_ROOT.iterdir() if p.is_dir() and _PROFILE_ID_RE.match(p.name)
+    )
+    return {"profiles": list(names)}
 
 
 @app.get("/admin/api/profiles/auth-status")
