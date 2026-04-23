@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { Plus, Trash2, Key, RefreshCw, Activity } from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import { Plus, Trash2, Key, RefreshCw, Activity, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -32,6 +32,21 @@ export function ProfilesPage() {
   const [selectedProfile, setSelectedProfile] = useState("");
   const [labelEmail, setLabelEmail] = useState("");
   const [cookiesInput, setCookiesInput] = useState("");
+  const [profileSearch, setProfileSearch] = useState("");
+
+  const filteredProfiles = useMemo(() => {
+    const q = profileSearch.trim().toLowerCase();
+    if (!q) {
+      return profiles;
+    }
+    return profiles.filter((p) => {
+      if (p.id.toLowerCase().includes(q)) {
+        return true;
+      }
+      const email = (p.email || "").toLowerCase();
+      return email.includes(q);
+    });
+  }, [profiles, profileSearch]);
 
   const loadProfiles = async (opts?: { probeLiveAuth?: boolean }) => {
     if (!getAdminKey()) {
@@ -305,9 +320,25 @@ export function ProfilesPage() {
       </div>
 
       <Card className="border-border/50 shadow-sm bg-card/50 backdrop-blur-sm overflow-hidden">
-        <CardHeader className="bg-white/[0.02]">
-          <CardTitle>Active Profiles</CardTitle>
-          <CardDescription>View and manage cookies for all available profiles.</CardDescription>
+        <CardHeader className="bg-white/[0.02] space-y-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <CardTitle>Active Profiles</CardTitle>
+              <CardDescription>View and manage cookies for all available profiles.</CardDescription>
+            </div>
+            <div className="relative w-full sm:max-w-xs">
+              <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+              <Input
+                type="search"
+                placeholder="Search by email or profile id…"
+                value={profileSearch}
+                onChange={(e) => setProfileSearch(e.target.value)}
+                className="pl-9"
+                autoComplete="off"
+                aria-label="Search profiles by email or id"
+              />
+            </div>
+          </div>
         </CardHeader>
         <CardContent className="p-0">
           <Table>
@@ -329,7 +360,14 @@ export function ProfilesPage() {
                   </TableCell>
                 </TableRow>
               )}
-              {profiles.map((profile) => {
+              {profiles.length > 0 && filteredProfiles.length === 0 && !loading && (
+                <TableRow>
+                  <TableCell colSpan={6} className="text-center py-8 text-muted-foreground">
+                    No profiles match &quot;{profileSearch.trim()}&quot;. Try another email or id fragment.
+                  </TableCell>
+                </TableRow>
+              )}
+              {filteredProfiles.map((profile) => {
                 const failedAuth =
                   profile.status === "UNAUTHENTICATED" ||
                   profile.status === "ERROR" ||
